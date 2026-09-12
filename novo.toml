@@ -1,6 +1,6 @@
 [package]
 name        = "tls-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Native TLS 1.3 (RFC 8446): the record layer, the handshake message codec, the key schedule, certificate chain validation over a caller-supplied root store, and a client and server handshake state machine that performs nothing — the host pumps it with `TlsAction`s.  The connection half sits over std.net and answers the shape std.tls already has, so this week's clients can pass it as their TLS hook.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
