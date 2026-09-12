@@ -1,0 +1,384 @@
+// tlshs_tests.nv — the certificate policy, the handshake state machine
+// and the connection surface.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tls-nv.<module>.<fn>`.
+//
+// THE HANDSHAKE ASSERTIONS RUN WITHOUT A SOCKET, and that is the point
+// of the design: the randomness, the key exchange, the certificate
+// verdict and the signature are all arguments, so a whole conversation
+// is a value a test writes out.
+
+use std.test
+use std.bytes
+use std.list
+use tlsmsg
+use tlssuite
+use tlscert
+use tlshs
+use tlsconn
+use civil
+
+fn any_instant() -> CivilDateTime
+    match civil.date(2026, 9, 12)
+        Ok(d)  => civil.datetime(d, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn refuse_everything(scheme: TlsSigScheme, spki: Bytes, message: Bytes, signature: Bytes) -> Bool
+    false
+
+fn supports_nothing(scheme: TlsSigScheme) -> Bool
+    false
+
+// Names `tlsconn`'s socket-side surface.  Reached only with a stream
+// that connected, which a connect to port 0 never does.
+fn over_a_real_socket(stream: TcpStream, s: TlsSession) -> Int [io, net, time]
+    let pipe = tlsconn.pipe_of(stream)
+    let cfg = tlshs.server_config([])
+    let accepted = match tlsconn.accept(stream, cfg, tlscert.no_checker())
+        Ok(c)  =>
+            let _ = tlsconn.stream_of(c)
+            let _ = tlsconn.session_of(c)
+            match tlsconn.close(c)
+                Some(_) => 1
+                None    => 0
+        Err(_) => 2
+    match tlsconn.handshake_over(pipe, s, any_instant(), tlscert.no_checker())
+        Ok(_)  => accepted
+        Err(_) => accepted
+
+@test
+fn test_the_name_is_matched_against_the_san_and_never_the_common_name() [io]
+    // CN fallback was deprecated in 2000 and removed from the browsers
+    // by 2017, and it is still the commonest way a hand-written client
+    // accepts a certificate issued for something else.  There is no CN
+    // accessor in this module at all.
+    test.case("a certificate with no SAN matches no name")
+    match tlscert.name_matches(bytes.zeros(0), "example.com", tlscert.default_cert_limits())
+        Ok(_)  => test.fail("empty DER is not a certificate")
+        Err(_) => test.assert(true)
+
+    test.case("and what it was issued for is readable, for a report")
+    match tlscert.dns_names_of(bytes.zeros(0), tlscert.default_cert_limits())
+        Ok(_)  => test.fail("empty DER carries no names")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_wildcard_matches_one_label_and_does_not_cross_a_dot() [io]
+    // A glob that treated `*` as "any characters" accepts
+    // `evil.com.example.com` from an authority that would issue
+    // `*.co.uk` and never `*.com`.
+    test.case("one leftmost label matches")
+    test.assert(tlscert.wildcard_matches("*.example.com", "a.example.com"))
+
+    test.case("the bare domain does not")
+    test.assert(not tlscert.wildcard_matches("*.example.com", "example.com"))
+
+    test.case("and two labels do not")
+    test.assert(not tlscert.wildcard_matches("*.example.com", "a.b.example.com"))
+
+    test.case("a wildcard that is not the leftmost label matches nothing")
+    test.assert(not tlscert.wildcard_matches("a.*.example.com", "a.b.example.com"))
+
+@test
+fn test_an_empty_root_store_trusts_nothing_and_says_so() [io]
+    // The right answer for a connection pinned by public key, and a
+    // better one than a store that silently trusted whatever the
+    // platform last installed.
+    test.case("an empty store holds no anchors")
+    test.assert_eq(tlscert.root_count(tlscert.empty_root_store()), 0)
+
+    test.case("and a store built from DER holds what it was given")
+    test.assert_eq(tlscert.root_count(tlscert.root_store([bytes.zeros(4)])), 1)
+
+@test
+fn test_a_chain_with_no_checker_names_the_missing_primitive() [io]
+    // There is no ECDSA and no RSA verification published on this grid,
+    // so the honest default is a checker that implements nothing and a
+    // refusal that says which scheme was wanted — rather than a chain
+    // that appeared to verify.
+    test.case("the empty checker supports nothing")
+    let checker = tlscert.no_checker()
+    match tlscert.schemes_supported([bytes.zeros(4)], checker, tlscert.default_cert_limits())
+        Ok(yes) => test.assert(not yes)
+        Err(_)  => test.assert(true)
+
+    test.case("and a chain checked with it is refused rather than accepted")
+    match tlscert.verify_chain([bytes.zeros(4)], "example.com", any_instant(),
+                               tlscert.empty_root_store(), checker,
+                               tlscert.default_cert_limits())
+        Ok(_)  => test.fail("nothing can verify a chain here yet")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_handshake_signature_is_checked_against_the_signers_role() [io]
+    // The two CertificateVerify labels differ precisely so a server's
+    // signature cannot be replayed as a client's, so the role is an
+    // argument and there is no default.
+    test.case("a checker that verifies nothing refuses")
+    match tlscert.verify_handshake_signature(tlscert.no_checker(), bytes.zeros(64),
+                                             TlsServerRole, TlsEcdsaP256Sha256,
+                                             bytes.zeros(32), bytes.zeros(64))
+        Ok(_)  => test.fail("no signature verifies without a verifier")
+        Err(_) => test.assert(true)
+
+    test.case("and a checker made of named functions is the shape the host pump takes")
+    let fns = tlscert.checker_of(refuse_everything, supports_nothing)
+    test.assert(not fns.tls_supports(TlsEcdsaP256Sha256))
+    test.assert(not fns.tls_check(TlsEcdsaP256Sha256, bytes.zeros(64), bytes.zeros(32),
+                                  bytes.zeros(64)))
+
+@test
+fn test_the_certificate_accessors_read_through_asn1_and_not_around_it() [io]
+    // This module parses no DER: every one of these is a policy over
+    // asn1-nv's parser, and empty input is refused by the parser rather
+    // than guessed at here.
+    let limits = tlscert.embedded_cert_limits()
+    let nothing_der = bytes.zeros(0)
+
+    test.case("validity, authority and path length")
+    match tlscert.valid_at(nothing_der, any_instant(), limits)
+        Ok(_)  => test.fail("empty DER has no validity window")
+        Err(_) => test.assert(true)
+    match tlscert.is_ca(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER has no basic constraints")
+        Err(_) => test.assert(true)
+    match tlscert.path_len_of(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER has no path length")
+        Err(_) => test.assert(true)
+
+    test.case("the usage rules")
+    match tlscert.allows_server_auth(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER has no key usage")
+        Err(_) => test.assert(true)
+    match tlscert.allows_client_auth(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER has no extended key usage")
+        Err(_) => test.assert(true)
+
+    test.case("and the signed bytes, the scheme, the signature and the key")
+    match tlscert.signed_data(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER has no tbsCertificate")
+        Err(_) => test.assert(true)
+    match tlscert.signature_scheme_of(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER names no algorithm")
+        Err(_) => test.assert(true)
+    match tlscert.signature_of(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER carries no signature")
+        Err(_) => test.assert(true)
+    match tlscert.spki_of(nothing_der, limits)
+        Ok(_)  => test.fail("empty DER carries no public key")
+        Err(_) => test.assert(true)
+    match tlscert.issued_by(nothing_der, nothing_der, limits)
+        Ok(_)  => test.fail("empty DER has no issuer to compare")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_action_is_the_interface() [io]
+    // Six of the eight variants say "the host does something and comes
+    // back", and the two that do not end the conversation.  There is no
+    // variant that means "I did something", and that absence is the
+    // sans-IO property written into a type.
+    test.case("a client session starts by wanting to write, not to read")
+    let cfg = tlshs.client_config("example.com", tlscert.empty_root_store())
+    let s = tlshs.client(cfg, bytes.zeros(32), [])
+    match tlshs.begin(s)
+        Err(_)   => test.fail("a ClientHello is the first thing a client has")
+        Ok(step) =>
+            match step.action
+                TlsSendBytes(n) => test.assert(n > 0)
+                _               => test.fail("the first action is bytes to send")
+
+    test.case("and the state it starts in is the one it names")
+    match tlshs.state_of(s)
+        TlsStart => test.assert(true)
+        _        => test.fail("a fresh session has not started")
+
+@test
+fn test_nothing_can_be_sent_before_the_handshake_completes() [io]
+    // The only thing that could be sent earlier is early data, and this
+    // package does not do early data: it is not replay protected, and a
+    // library that made it one option among several has made a
+    // replayable request the default for whoever did not read the
+    // README.
+    test.case("application data before TlsConnected is refused")
+    let cfg = tlshs.client_config("example.com", tlscert.empty_root_store())
+    let s = tlshs.client(cfg, bytes.zeros(32), [])
+    match tlshs.send_application_data(s, bytes.from_str("GET / HTTP/1.1\r\n"))
+        Ok(_)  => test.fail("there is no early data in this package")
+        Err(_) => test.assert(true)
+
+    test.case("and the session says it is not done")
+    test.assert(not tlshs.is_handshake_done(s))
+
+@test
+fn test_an_answer_to_a_question_nobody_asked_is_refused() [io]
+    // Three of the actions are questions the host answers.  A verdict,
+    // a shared secret or a signature supplied when nothing was pending
+    // is a programming error and not something to absorb quietly.
+    let cfg = tlshs.client_config("example.com", tlscert.empty_root_store())
+    let s = tlshs.client(cfg, bytes.zeros(32), [])
+
+    test.case("a shared secret with no key exchange pending")
+    match tlshs.supply_shared_secret(s, bytes.zeros(32))
+        Ok(_)  => test.fail("nothing asked for a key exchange")
+        Err(e) =>
+            match e
+                TlsHsNothingPending(_) => test.assert(true)
+                _                      => test.fail("the fault names what was answered")
+
+    test.case("a certificate verdict with no chain pending")
+    match tlshs.supply_certificate_verdict(s, None)
+        Ok(_)  => test.fail("no chain has arrived")
+        Err(_) => test.assert(true)
+
+    test.case("a signature with nothing to sign")
+    match tlshs.supply_signature(s, bytes.zeros(64))
+        Ok(_)  => test.fail("nothing asked for a signature")
+        Err(_) => test.assert(true)
+
+    test.case("and none of the three has anything pending to read")
+    test.assert_eq(list.len(tlshs.pending_chain(s)), 0)
+    match tlshs.pending_key_exchange(s)
+        Some(_) => test.fail("no key exchange is pending")
+        None    => test.assert(true)
+    match tlshs.pending_signature_input(s)
+        Some(_) => test.fail("no signature is pending")
+        None    => test.assert(true)
+
+@test
+fn test_every_alert_but_one_is_fatal() [io]
+    // The warning level is gone in TLS 1.3.  close_notify is the only
+    // alert that is not the end of the connection, and this function
+    // exists so a reader of calling code can see that rather than
+    // having to know it.
+    test.case("close_notify is not fatal")
+    test.assert(not tlshs.is_fatal(TlsCloseNotify))
+
+    test.case("bad_record_mac is")
+    test.assert(tlshs.is_fatal(TlsBadRecordMac))
+
+    test.case("and the codes round-trip")
+    test.assert_eq(tlshs.alert_code(TlsCloseNotify), 0)
+    match tlshs.alert_of_code(20)
+        TlsBadRecordMac => test.assert(true)
+        _               => test.fail("20 is bad_record_mac")
+
+@test
+fn test_the_configuration_builders_are_complete() [io]
+    // Every remaining `pub fn` of `tlshs`, named once.
+    test.case("a client configuration is built up by name")
+    let cfg = tlshs.with_limits(
+        tlshs.with_schemes(
+            tlshs.with_groups(
+                tlshs.with_suites(
+                    tlshs.with_alpn(tlshs.client_config("example.com",
+                                                        tlscert.empty_root_store()),
+                                    ["h2", "http/1.1"]),
+                    tlssuite.default_suites()),
+                tlsmsg.default_groups()),
+            tlsmsg.default_schemes()),
+        tlsmsg.embedded_limits(), tlscert.embedded_cert_limits())
+    test.assert_eq(cfg.server_name, "example.com")
+
+    test.case("and so is a server's")
+    let scfg = tlshs.with_server_schemes(
+        tlshs.with_client_auth(
+            tlshs.with_server_alpn(tlshs.server_config([bytes.zeros(4)]), ["h2"]),
+            tlscert.empty_root_store()),
+        tlsmsg.default_schemes())
+    test.assert(scfg.request_client_auth)
+
+    test.case("a server session is the same shape as a client's")
+    let srv = tlshs.server(scfg, bytes.zeros(32), [])
+    match tlshs.begin(srv)
+        Ok(step) =>
+            match step.action
+                TlsWantMoreBytes(_) => test.assert(true)
+                _                   => test.fail("a server waits for a ClientHello")
+        Err(_)   => test.fail("a server with a chain can start")
+
+@test
+fn test_the_session_surface_is_complete() [io]
+    // Every remaining `pub fn` of `tlshs`, named once.
+    let cfg = tlshs.client_config("example.com", tlscert.empty_root_store())
+    let s = tlshs.client(cfg, bytes.zeros(32), [])
+
+    test.case("bytes go in and come out by name")
+    match tlshs.feed(s, [22, 3, 3, 0, 0])
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    let drained = tlshs.take_outgoing(s)
+    test.assert_eq(bytes.len(drained.1), 0)
+    let plain = tlshs.take_plaintext(s)
+    test.assert_eq(bytes.len(plain.1), 0)
+
+    test.case("what was agreed is unknown before anything was agreed")
+    match tlshs.alpn_of(s)
+        Some(_) => test.fail("nothing has been negotiated")
+        None    => test.assert(true)
+    match tlshs.suite_of(s)
+        Some(_) => test.fail("no suite has been chosen")
+        None    => test.assert(true)
+    test.assert_eq(list.len(tlshs.peer_chain_of(s)), 0)
+    test.assert_eq(list.len(tlshs.tickets_of(s)), 0)
+
+    test.case("a key update and a close and an abort are all steps")
+    match tlshs.request_key_update(s, true)
+        Ok(_)  => test.fail("there is no key to update yet")
+        Err(_) => test.assert(true)
+    match tlshs.close(s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match tlshs.abort(s, TlsHandshakeFailure)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_pem_is_decoded_without_touching_a_filesystem() [io]
+    // `roots_from_pem` and its two neighbours are `[]`: base64-nv
+    // decodes and asn1-nv parses, and neither of them reads anything.
+    // `system_roots` is the one function in the package that does.
+    test.case("text with no PEM block in it is refused")
+    match tlsconn.roots_from_pem("not a certificate")
+        Ok(_)  => test.fail("there is no BEGIN CERTIFICATE here")
+        Err(_) => test.assert(true)
+
+    match tlsconn.certificates_from_pem("not a certificate")
+        Ok(_)  => test.fail("there is no BEGIN CERTIFICATE here")
+        Err(_) => test.assert(true)
+
+    test.case("and an empty chain renders as empty text")
+    test.assert_eq(tlsconn.certificates_to_pem([]), "")
+
+@test
+fn test_the_connection_surface_is_complete() [io, net, time, fs]
+    // The four rows this package declares, each spent by the function
+    // that is named after what it does.
+    test.case("the clock read is one function")
+    let at = tlsconn.now_civil()
+    test.assert(at.date.year > 2000)
+
+    test.case("and so is the filesystem read")
+    match tlsconn.system_roots()
+        Ok(store) => test.assert(tlscert.root_count(store) >= 0)
+        Err(_)    => test.assert(true)
+
+    test.case("a dial that cannot connect is a named fault, not a null")
+    let cfg = tlshs.client_config("example.com", tlscert.empty_root_store())
+    match tlsconn.dial("127.0.0.1", 0, cfg, tlscert.no_checker())
+        Ok(c)  =>
+            let _ = tlsconn.send(c, bytes.from_str("x"))
+            let _ = tlsconn.recv(c, 16)
+            match tlsconn.alpn_of(c)
+                Some(_) => test.assert(true)
+                None    => test.assert(true)
+            match tlsconn.suite_of(c)
+                Some(_) => test.assert(true)
+                None    => test.assert(true)
+            test.assert_eq(list.len(tlsconn.peer_chain_of(c)), 0)
+        Err(_) => test.assert(true)
+
+    test.case("and the socket-side surface is reachable from a stream")
+    match TcpStream.connect("127.0.0.1", 0)
+        Some(stream) => test.assert(over_a_real_socket(stream, tlshs.client(cfg, bytes.zeros(32), [])) >= 0)
+        None         => test.assert(true)

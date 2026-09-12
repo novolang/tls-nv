@@ -1,0 +1,555 @@
+// tlswire_tests.nv — the record layer, the handshake codec, the AEAD
+// arithmetic and the key schedule: everything in this package that
+// touches nothing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: tls-nv.<module>.<fn>`.  That
+// is the expected result until the bodies land.
+//
+// NO SOCKET IN THIS FILE, AND THAT IS THE PACKAGE'S CLAIM WORKING.  Six
+// of the seven modules are `[]` throughout, so a whole handshake
+// transcript is a byte array a test writes out and every answer is
+// reproducible.
+
+use std.test
+use std.bytes
+use std.list
+use tlsrec
+use tlssuite
+use tlsmsg
+use tlskey
+use digest
+
+fn wire(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+@test
+fn test_the_outer_content_type_is_not_the_real_one() [io]
+    // After the handshake keys are in use every record on the wire says
+    // type 23, application_data, whatever it carries.  The real type is
+    // the last non-zero byte of the decrypted plaintext.  A reader that
+    // branched on the header hands a session ticket to the application.
+    test.case("the header's own type reads as application data")
+    match tlsrec.kind_of_code(23)
+        TlsAppDataContent => test.assert(true)
+        _                 => test.fail("23 is application_data in the header")
+
+    test.case("and the plaintext's last non-zero byte says handshake")
+    // A Finished body, then the inner content type 22, then padding.
+    let plaintext = bytes.from_str("\u{14}\u{00}\u{00}\u{20}abcd\u{16}\u{00}\u{00}")
+    match tlsrec.inner_kind(plaintext)
+        Ok(k)  =>
+            match k
+                TlsHandshakeContent => test.assert(true)
+                _                   => test.fail("the inner type is 22, not 23")
+        Err(_) => test.fail("a plaintext with an inner type is not malformed")
+
+@test
+fn test_a_record_of_nothing_but_padding_is_an_error() [io]
+    // RFC 8446 § 5.4: all-zero plaintext has no inner content type and
+    // is an unexpected_message.  An implementation that answered
+    // "zero-length application data" gives a peer a free way to make a
+    // reader see end of stream.
+    test.case("all padding is refused, not read as an empty message")
+    match tlsrec.inner_kind(bytes.zeros(16))
+        Ok(_)  => test.fail("all-zero plaintext has no content type")
+        Err(e) =>
+            match e
+                TlsRecordAllPadding => test.assert(true)
+                _                   => test.fail("the fault names the padding")
+
+    test.case("and its content length is refused for the same reason")
+    match tlsrec.inner_len(bytes.zeros(16))
+        Ok(_)  => test.fail("there is no content in a padding-only record")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_two_length_ceilings_are_different_numbers() [io]
+    // A plaintext fragment is at most 2^14; the record carrying it is
+    // at most 2^14 + 256.  One number used for both either refuses a
+    // maximal record from a correct peer or lets one overrun the
+    // buffer the application sized.
+    test.case("the plaintext ceiling is sixteen kilobytes")
+    test.assert_eq(tlsrec.TLS_PLAINTEXT_MAX, 16384)
+
+    test.case("and the wire ceiling is 256 bytes more")
+    test.assert_eq(tlsrec.TLS_CIPHERTEXT_MAX, 16640)
+
+    test.case("a record past the wire ceiling is refused with both numbers")
+    match tlsrec.head_at(bytes.from_str("\u{17}\u{03}\u{03}\u{ff}\u{ff}"), 0,
+                         tlsrec.TLS_CIPHERTEXT_MAX)
+        Ok(_)  => test.fail("65535 bytes is past every ceiling")
+        Err(e) =>
+            match e
+                TlsRecordOverLong(length, limit) =>
+                    test.assert_eq(length, 65535)
+                    test.assert_eq(limit, tlsrec.TLS_CIPHERTEXT_MAX)
+                _                                => test.fail("the fault carries the length and the limit")
+
+    test.case("and the ceiling depends on whether the keys are in use")
+    test.assert(tlsrec.limit_for(TlsAppDataContent, true) > tlsrec.limit_for(TlsAppDataContent, false))
+
+@test
+fn test_the_legacy_version_field_decides_nothing() [io]
+    // 0x0303 on every 1.3 record, and it means TLS 1.2.  A reader that
+    // refused a record whose legacy version differed would refuse
+    // correct peers behind unhelpful middleboxes.
+    test.case("the frozen value is the one every record writes")
+    test.assert_eq(tlsrec.TLS_LEGACY_RECORD_VERSION, 0x0303)
+
+    test.case("and a reader can ask, without the package acting on it")
+    test.assert(tlsrec.is_legacy_version(0x0303))
+
+@test
+fn test_a_record_reader_reassembles_across_chunks() [io]
+    test.case("five header bytes arrive first and are not yet a record")
+    let r = tlsrec.reader()
+    match tlsrec.feed(r, wire("\u{16}\u{03}\u{03}\u{00}\u{04}"))
+        Err(_) => test.fail("a header on its own is not malformed")
+        Ok(s)  =>
+            match s
+                TlsRecordNeedBytes(least) => test.assert_eq(least, 4)
+                _                         => test.fail("four more bytes are needed")
+
+    test.case("and a smaller ceiling refuses what the default accepts")
+    let small = tlsrec.reader_with(64)
+    test.assert_eq(tlsrec.pending_len(small), 0)
+
+@test
+fn test_the_record_nonce_is_an_xor_and_not_a_concatenation() [io]
+    // RFC 8446 § 5.3.  An implementation that appended a counter to a
+    // salt — which is what TLS 1.2's GCM did — produces a nonce that
+    // interoperates with nothing, and if it ever repeats one, a
+    // polynomial MAC gives up its authentication key.
+    test.case("sequence zero leaves the static IV alone")
+    let iv = bytes.zeros(12)
+    let out = tlssuite.record_nonce(iv, 0, bytes.zeros(12))
+    test.assert_eq(bytes.len(out), 12)
+
+    test.case("the IV is twelve bytes for every suite here")
+    test.assert_eq(tlssuite.suite_iv_bytes(TlsChaCha20Poly1305Sha256), 12)
+
+@test
+fn test_the_associated_data_is_the_record_header_and_nothing_else() [io]
+    // TLS 1.2 authenticated the sequence number here and 1.3 does not,
+    // because the nonce carries it.  A port that kept 1.2's habit opens
+    // no record a correct peer sends.
+    test.case("five bytes, the header's own")
+    test.assert_eq(bytes.len(tlssuite.record_aad(23, 100)), tlsrec.TLS_RECORD_HEADER_BYTES)
+
+@test
+fn test_the_only_suite_with_a_primitive_under_it_says_so() [io]
+    // Three of the four suites need an AES block cipher and there is
+    // none on this grid.  A client that offered one and had it chosen
+    // fails the handshake after the server has committed, which is
+    // worse than not offering it.
+    test.case("ChaCha20-Poly1305 can be performed")
+    test.assert(tlssuite.suite_is_available(TlsChaCha20Poly1305Sha256))
+
+    test.case("AES-128-GCM cannot, today")
+    test.assert(not tlssuite.suite_is_available(TlsAes128GcmSha256))
+
+    test.case("and the default offer is only what can be performed")
+    test.assert_eq(list.len(tlssuite.default_suites()), 1)
+
+    test.case("while the package can still name every suite it knows")
+    test.assert(list.len(tlssuite.known_suites()) > list.len(tlssuite.default_suites()))
+
+@test
+fn test_the_sha384_suites_have_no_hash_on_this_grid() [io]
+    // hkdf-nv carries SHA-256, SHA-512 and SHA-1, and crypto-nv under
+    // it the same three plus MD5.  There is no SHA-384 anywhere, so a
+    // suite that names it has no key schedule to run.
+    test.case("SHA-256 suites have their hash")
+    match tlssuite.suite_hash(TlsChaCha20Poly1305Sha256)
+        Some(_) => test.assert(true)
+        None    => test.fail("SHA-256 is published")
+
+    test.case("and the SHA-384 suite answers None rather than a substitute")
+    match tlssuite.suite_hash(TlsAes256GcmSha384)
+        Some(_) => test.fail("there is no SHA-384 on the grid")
+        None    => test.assert(true)
+
+@test
+fn test_the_version_is_in_the_extension_and_not_the_version_field() [io]
+    // Both hello messages say 0x0303 in their version field on every
+    // 1.3 handshake.  A client that read it concludes it is speaking
+    // 1.2 and derives every key with the wrong schedule.
+    test.case("supported_versions is where the answer is")
+    match tlsmsg.ext_kind_of_code(43)
+        TlsSupportedVersionsExt => test.assert(true)
+        _                       => test.fail("43 is supported_versions")
+
+    test.case("and a ServerHello without it is a peer that is not speaking 1.3")
+    let sh = TlsServerHello {
+        random: bytes.zeros(32),
+        legacy_session_id_echo: bytes.zeros(0),
+        suite: TlsChaCha20Poly1305Sha256,
+        key_share: None,
+        retry_group: None,
+        selected_psk: None,
+        extensions: [] }
+    match tlsmsg.selected_version(sh)
+        Ok(_)  => test.fail("no extension means no version")
+        Err(e) =>
+            match e
+                TlsMsgExtensionMissing(_) => test.assert(true)
+                _                         => test.fail("the fault names the missing extension")
+
+@test
+fn test_a_hello_retry_request_is_a_server_hello_with_a_constant() [io]
+    // RFC 8446 § 4.1.3 defines it as a ServerHello whose 32 random
+    // bytes are a fixed value, not as a message of its own.  A client
+    // that missed the check installs keys from a key share the server
+    // never sent.
+    test.case("the constant is thirty-two bytes")
+    test.assert_eq(bytes.len(tlsmsg.hello_retry_random()), 32)
+
+    test.case("a ServerHello carrying it is a retry")
+    let hrr = TlsServerHello {
+        random: tlsmsg.hello_retry_random(),
+        legacy_session_id_echo: bytes.zeros(0),
+        suite: TlsChaCha20Poly1305Sha256,
+        key_share: None,
+        retry_group: Some(TlsX25519Group),
+        selected_psk: None,
+        extensions: [] }
+    test.assert(tlsmsg.is_hello_retry_request(hrr))
+
+@test
+fn test_the_server_chooses_the_alpn_protocol() [io]
+    // RFC 7301 § 3.2: the server's preference decides.  A server that
+    // walked the client's list left to right has let the client pick
+    // whichever protocol it handles worst.
+    test.case("the server's first supported protocol wins, not the client's")
+    match tlsmsg.alpn_pick(["http/1.1", "h2"], ["h2", "http/1.1"])
+        Some(p) => test.assert_eq(p, "h2")
+        None    => test.fail("both sides named h2")
+
+    test.case("and nothing in common is None rather than a default")
+    match tlsmsg.alpn_pick(["http/1.1"], ["h3"])
+        Some(_) => test.fail("there is no overlap to pick from")
+        None    => test.assert(true)
+
+@test
+fn test_the_certificate_verify_context_differs_by_role() [io]
+    // 64 spaces, then a label, then a zero byte, then the transcript
+    // hash.  The spaces stop a TLS signature being replayed into a
+    // protocol that signs a bare hash; the differing labels stop a
+    // server's signature being replayed as a client's.
+    test.case("the two roles produce different signed content")
+    let ctx_hash = bytes.zeros(32)
+    let server_side = tlsmsg.verify_context(TlsServerRole, ctx_hash)
+    let client_side = tlsmsg.verify_context(TlsClientRole, ctx_hash)
+    test.assert(not digest.ct_eq(server_side, client_side))
+
+    test.case("and both begin with the same 64 bytes of padding")
+    test.assert(bytes.len(server_side) > 64 + 32)
+
+@test
+fn test_expand_label_is_not_expand() [io]
+    // RFC 8446 § 7.1 puts a structure in the info field: a two-byte
+    // length, a length-prefixed "tls13 " + label, a length-prefixed
+    // context.  Passing the bare label to hkdf-nv's expand gives a key
+    // that is uniformly random, passes every self-test, and
+    // interoperates with nothing.
+    test.case("the prefix is part of the construction")
+    test.assert_eq(tlskey.TLS_LABEL_PREFIX, "tls13 ")
+
+    test.case("and a derivation answers the buffer it was given")
+    match tlskey.hkdf_expand_label(HkdfSha256, bytes.zeros(32), "key",
+                                   bytes.zeros(0), bytes.zeros(32))
+        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+        Err(_) => test.fail("a 32-byte output from SHA-256 is in range")
+
+@test
+fn test_a_hello_retry_request_rewrites_the_transcript() [io]
+    // The first ClientHello is REPLACED by a synthetic message_hash
+    // message carrying its hash.  Appending ClientHello1,
+    // HelloRetryRequest, ClientHello2 in the obvious order gives a
+    // transcript that differs from the peer's from that point on.
+    test.case("the synthetic message type is 254")
+    test.assert_eq(tlskey.TLS_MESSAGE_HASH_TYPE, 254)
+
+    test.case("an empty transcript has nothing to replace")
+    match tlskey.transcript_replace(tlskey.transcript(HkdfSha256))
+        Ok(_)  => test.fail("there is no ClientHello to fold")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_finished_comparison_is_constant_time() [io]
+    // The peer chooses one side of this comparison.  A comparison that
+    // stopped at the first differing byte tells them how much of their
+    // guess was right.
+    test.case("equal values match")
+    test.assert(tlskey.finished_matches(bytes.zeros(32), bytes.zeros(32)))
+
+    test.case("and different ones do not")
+    test.assert(not tlskey.finished_matches(bytes.zeros(32), bytes.from_str("x")))
+
+@test
+fn test_installing_a_key_resets_the_sequence_number() [io]
+    // A new key is a new nonce space.  A value that carried the old
+    // count would repeat a nonce on the very first record under the new
+    // key.
+    test.case("traffic keys come out with the sequence at zero")
+    match tlskey.traffic_keys(HkdfSha256, bytes.zeros(32), TlsChaCha20Poly1305Sha256)
+        Ok(k)  => test.assert_eq(k.sequence, 0)
+        Err(_) => test.fail("a 32-byte secret is the right size for SHA-256")
+
+    test.case("and the suite has a ceiling the sequence cannot pass")
+    test.assert(tlssuite.sequence_limit(TlsChaCha20Poly1305Sha256) > 0)
+
+@test
+fn test_the_record_surface_is_complete() [io]
+    // Every remaining `pub fn` of `tlsrec` and `tlssuite`, named once
+    // so the interface's shape is checked by the compiler and the
+    // suite's coverage row is honest.
+    test.case("the record layer's encoders and accessors")
+    let r = tlsrec.reader()
+    test.assert_eq(tlsrec.kind_code(TlsHandshakeContent), 22)
+    test.assert_eq(tlsrec.ciphertext_len(100, 0, 16), 117)
+
+    var head_buf = bytes.cursor_be(bytes.zeros(8))
+    match tlsrec.write_head_into(TlsHandshakeContent, 4, head_buf)
+        Ok(n)  => test.assert_eq(n, tlsrec.TLS_RECORD_HEADER_BYTES)
+        Err(_) => test.fail("eight bytes hold a five-byte header")
+
+    var pad_buf = bytes.cursor_be(bytes.zeros(32))
+    match tlsrec.pad_into(TlsHandshakeContent, bytes.from_str("abc"), 4, pad_buf)
+        Ok(n)  => test.assert_eq(n, 8)
+        Err(_) => test.fail("three bytes, a type and four of padding fit in 32")
+
+    match tlsrec.take(r)
+        Ok(_)  => test.fail("an empty reader has no record to take")
+        Err(_) => test.assert(true)
+
+    let head = TlsRecordHead {
+        kind: TlsHandshakeContent,
+        legacy_version: tlsrec.TLS_LEGACY_RECORD_VERSION,
+        length: 4,
+        fragment_at: 5 }
+    test.assert_eq(bytes.len(tlsrec.fragment_of(r, head)), 0)
+
+    test.case("and the suite table")
+    test.assert_eq(tlssuite.suite_code(TlsChaCha20Poly1305Sha256), 0x1303)
+    match tlssuite.suite_of_code(0x1301)
+        TlsAes128GcmSha256 => test.assert(true)
+        _                  => test.fail("0x1301 is TLS_AES_128_GCM_SHA256")
+    test.assert_eq(tlssuite.suite_name(TlsChaCha20Poly1305Sha256), "TLS_CHACHA20_POLY1305_SHA256")
+    test.assert_eq(tlssuite.suite_key_bytes(TlsChaCha20Poly1305Sha256), 32)
+    test.assert_eq(tlssuite.suite_tag_bytes(TlsChaCha20Poly1305Sha256), 16)
+
+    var sealed = bytes.cursor_be(bytes.zeros(64))
+    match tlssuite.seal_into(TlsChaCha20Poly1305Sha256, bytes.zeros(32), bytes.zeros(12), 0,
+                             tlssuite.record_aad(23, 19), bytes.from_str("abc"), sealed)
+        Ok(n)  => test.assert_eq(n, 19)
+        Err(_) => test.fail("three bytes plus a tag fit in 64")
+
+    var opened = bytes.cursor_be(bytes.zeros(64))
+    match tlssuite.open_into(TlsChaCha20Poly1305Sha256, bytes.zeros(32), bytes.zeros(12), 0,
+                             tlssuite.record_aad(23, 19), bytes.zeros(19), opened)
+        Ok(_)  => test.fail("a zero ciphertext does not authenticate")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_message_codec_surface_is_complete() [io]
+    // Every remaining `pub fn` of `tlsmsg`, named once.
+    test.case("the code-point tables round-trip")
+    test.assert_eq(tlsmsg.msg_kind_code(TlsFinishedKind), 20)
+    match tlsmsg.msg_kind_of_code(1)
+        TlsClientHelloKind => test.assert(true)
+        _                  => test.fail("1 is client_hello")
+    test.assert_eq(tlsmsg.group_code(TlsX25519Group), 0x001d)
+    match tlsmsg.group_of_code(0x0017)
+        TlsSecp256r1Group => test.assert(true)
+        _                 => test.fail("0x0017 is secp256r1")
+    test.assert_eq(tlsmsg.group_key_bytes(TlsX25519Group), 32)
+    test.assert(tlsmsg.group_is_available(TlsX25519Group))
+    test.assert(not tlsmsg.group_is_available(TlsSecp384r1Group))
+    test.assert(list.len(tlsmsg.default_groups()) > 0)
+    test.assert_eq(tlsmsg.scheme_code(TlsEcdsaP256Sha256), 0x0403)
+    match tlsmsg.scheme_of_code(0x0807)
+        TlsEd25519Sig => test.assert(true)
+        _             => test.fail("0x0807 is ed25519")
+    test.assert(list.len(tlsmsg.default_schemes()) > 0)
+    test.assert_eq(tlsmsg.ext_kind_code(TlsAlpnExt), 16)
+
+    test.case("the limits are values a caller constructs")
+    let limits = tlsmsg.default_limits()
+    test.assert(limits.max_certificates > 0)
+    test.assert(tlsmsg.embedded_limits().max_message_bytes <= limits.max_message_bytes)
+
+    test.case("the parsers refuse an empty body rather than inventing one")
+    let empty = bytes.zeros(0)
+    match tlsmsg.msg_head_at(empty, 0, limits)
+        Ok(_)  => test.fail("no bytes is no message")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_client_hello(empty, limits)
+        Ok(_)  => test.fail("no bytes is no ClientHello")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_server_hello(empty, limits)
+        Ok(_)  => test.fail("no bytes is no ServerHello")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_encrypted_extensions(empty, limits)
+        Ok(_)  => test.fail("no bytes is no extension list")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_certificate(empty, limits)
+        Ok(_)  => test.fail("no bytes is no Certificate")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_certificate_verify(empty, limits)
+        Ok(_)  => test.fail("no bytes is no CertificateVerify")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_finished(empty, 32)
+        Ok(_)  => test.fail("no bytes is no Finished")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_ticket(empty, limits)
+        Ok(_)  => test.fail("no bytes is no ticket")
+        Err(_) => test.assert(true)
+    match tlsmsg.parse_key_update(empty)
+        Ok(_)  => test.fail("no bytes is no KeyUpdate")
+        Err(_) => test.assert(true)
+
+    test.case("and the writers answer bytes")
+    let ch = TlsClientHello {
+        random: bytes.zeros(32),
+        legacy_session_id: bytes.zeros(32),
+        suites: tlssuite.default_suites(),
+        server_name: "example.com",
+        groups: tlsmsg.default_groups(),
+        schemes: tlsmsg.default_schemes(),
+        key_shares: [],
+        alpn: ["h2"],
+        extensions: [] }
+    match tlsmsg.write_client_hello(ch)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("a hello with a name and a suite is writable")
+    match tlsmsg.server_name_of(ch)
+        Some(n) => test.assert_eq(n, "example.com")
+        None    => test.fail("the hello carries a name")
+
+    let sh = TlsServerHello {
+        random: bytes.zeros(32),
+        legacy_session_id_echo: bytes.zeros(32),
+        suite: TlsChaCha20Poly1305Sha256,
+        key_share: None,
+        retry_group: None,
+        selected_psk: None,
+        extensions: [] }
+    match tlsmsg.write_server_hello(sh)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("a ServerHello with a suite is writable")
+
+    match tlsmsg.write_encrypted_extensions([])
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("an empty extension list is a legal message")
+
+    let cert_msg = TlsCertificateMsg { request_context: bytes.zeros(0), entries: [] }
+    match tlsmsg.write_certificate(cert_msg)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("an empty chain is a legal message")
+
+    let cv = TlsCertVerifyMsg { scheme: TlsEcdsaP256Sha256, signature: bytes.zeros(64) }
+    match tlsmsg.write_certificate_verify(cv)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("a signature and a scheme are a message")
+
+    match tlsmsg.write_finished(bytes.zeros(32))
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("32 bytes of verify_data is a Finished")
+
+    match tlsmsg.write_key_update(false)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+        Err(_) => test.fail("a KeyUpdate is one byte of body")
+
+    match tlsmsg.server_name_extension("example.com")
+        Ok(e)  => test.assert(bytes.len(e.body) > 0)
+        Err(_) => test.fail("a hostname is an extension")
+    match tlsmsg.alpn_extension(["h2"])
+        Ok(e)  => test.assert(bytes.len(e.body) > 0)
+        Err(_) => test.fail("one protocol is an extension")
+    match tlsmsg.key_share_extension([])
+        Ok(e)  => test.assert(bytes.len(e.body) >= 0)
+        Err(_) => test.fail("an empty key share list is legal in a retry")
+    match tlsmsg.supported_versions_extension(TlsClientRole)
+        Ok(e)  =>
+            match tlsmsg.extension_by_kind([e], TlsSupportedVersionsExt)
+                Some(_) => test.assert(true)
+                None    => test.fail("the extension it built is the one it looks for")
+        Err(_) => test.fail("the client's supported_versions is two bytes")
+
+@test
+fn test_the_key_schedule_surface_is_complete() [io]
+    // Every remaining `pub fn` of `tlskey`, named once.
+    test.case("a transcript absorbs whole messages, header included")
+    let t0 = tlskey.transcript(HkdfSha256)
+    let t1 = tlskey.transcript_update(t0, bytes.from_str("\u{01}\u{00}\u{00}\u{00}"))
+    test.assert_eq(tlskey.transcript_len(t1), 1)
+    match tlskey.transcript_hash(t1, bytes.zeros(32))
+        Ok(h)  => test.assert_eq(bytes.len(h), 32)
+        Err(_) => test.fail("SHA-256 fills a 32-byte buffer")
+    match tlskey.empty_transcript_hash(HkdfSha256, bytes.zeros(32))
+        Ok(h)  => test.assert_eq(bytes.len(h), 32)
+        Err(_) => test.fail("the empty hash is the same width")
+
+    test.case("the ladder is climbed in order and refuses a step out of it")
+    let s0 = tlskey.schedule(HkdfSha256)
+    match tlskey.advance_to_handshake(s0, t1)
+        Ok(_)  => test.fail("there is no shared secret folded in yet")
+        Err(e) =>
+            match e
+                TlsKeyOutOfOrder(_, _) => test.assert(true)
+                _                      => test.fail("the fault names both steps")
+
+    match tlskey.without_psk(s0)
+        Err(_) => test.fail("a handshake with no PSK still extracts")
+        Ok(s1) =>
+            match tlskey.with_shared_secret(s1, bytes.zeros(32))
+                Err(_) => test.fail("32 bytes is an X25519 output")
+                Ok(s2) =>
+                    match tlskey.advance_to_handshake(s2, t1)
+                        Err(_) => test.fail("the ladder is in order now")
+                        Ok(s3) =>
+                            match tlskey.handshake_secret_of(s3, TlsServerRole)
+                                Ok(k)  => test.assert_eq(bytes.len(k), 32)
+                                Err(_) => test.fail("the handshake secret is a hash width")
+                            match tlskey.advance_to_application(s3, t1)
+                                Err(_) => test.fail("the server's Finished fixes the app keys")
+                                Ok(s4) =>
+                                    match tlskey.traffic_secret_of(s4, TlsClientRole)
+                                        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+                                        Err(_) => test.fail("the traffic secret is a hash width")
+                                    match tlskey.resumption_secret(s4, t1, bytes.zeros(32))
+                                        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+                                        Err(_) => test.fail("the resumption secret is a hash width")
+                                    match tlskey.exporter(s4, t1, "EXPORTER-test", bytes.zeros(0), bytes.zeros(32))
+                                        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+                                        Err(_) => test.fail("an exporter of 32 bytes is in range")
+
+    match tlskey.with_psk(s0, bytes.zeros(32))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a 32-byte PSK extracts")
+
+    test.case("and the Finished key, the verify data and the ratchet")
+    match tlskey.finished_key(HkdfSha256, bytes.zeros(32), bytes.zeros(32))
+        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+        Err(_) => test.fail("the Finished key is a hash width")
+    match tlskey.finished_verify(HkdfSha256, bytes.zeros(32), t1, bytes.zeros(32))
+        Ok(v)  => test.assert_eq(bytes.len(v), 32)
+        Err(_) => test.fail("the verify data is a hash width")
+    match tlskey.ticket_psk(HkdfSha256, bytes.zeros(32), bytes.zeros(8), bytes.zeros(32))
+        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+        Err(_) => test.fail("a ticket's PSK is a hash width")
+    match tlskey.update_traffic_secret(HkdfSha256, bytes.zeros(32), bytes.zeros(32))
+        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+        Err(_) => test.fail("the ratchet answers a hash width")
+    match tlskey.derive_secret(HkdfSha256, bytes.zeros(32), "c hs traffic", t1, bytes.zeros(32))
+        Ok(k)  => test.assert_eq(bytes.len(k), 32)
+        Err(_) => test.fail("a derive_secret output is a hash width")
+
+    match tlskey.traffic_keys(HkdfSha256, bytes.zeros(32), TlsChaCha20Poly1305Sha256)
+        Err(_) => test.fail("a 32-byte secret makes a ChaCha20 key")
+        Ok(k)  =>
+            match tlskey.next_sequence(k, TlsChaCha20Poly1305Sha256)
+                Ok(k2) => test.assert_eq(k2.sequence, 1)
+                Err(_) => test.fail("the second record is in range")

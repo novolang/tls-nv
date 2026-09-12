@@ -1,0 +1,271 @@
+// tlsrec.nv — the TLS 1.3 record layer: five header bytes, and the two
+// places a record says something other than what it appears to say.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE.  Every row is
+// `[]`, nothing is read and nothing is written, and the README argues
+// the `tls-core-nv` row this module would move to.
+//
+// THE OUTER CONTENT TYPE IS A LIE, ON PURPOSE.  Once the handshake keys
+// are in use every record on the wire carries type 23,
+// `application_data`, whatever it actually contains — a Finished, an
+// alert, a session ticket.  The real type is the LAST NON-ZERO BYTE of
+// the decrypted inner plaintext, after the zero padding is stripped.
+// A decoder that branched on the header's type would see a connection
+// made entirely of application data and would hand a session ticket to
+// the application as if the server had sent it.  `kind_of_code` reads
+// the header and `inner_kind` reads the plaintext, and the two are
+// different functions because they answer different questions.
+//
+// THE LEGACY VERSION FIELD IS NOT THE VERSION.  It is `0x0303` on every
+// record TLS 1.3 sends and it means nothing: the version is negotiated
+// in the `supported_versions` extension and nowhere else.  Middleboxes
+// deployed before 1.3 drop records that say anything newer, which is
+// why the field was frozen rather than removed.  `is_legacy_version`
+// exists so a caller can assert what it is; NOTHING IN THIS PACKAGE
+// BRANCHES ON IT, because an implementation that refused a record whose
+// legacy version was not what it expected would refuse real servers.
+//
+// TWO LENGTH CEILINGS, NOT ONE.  A plaintext fragment is at most 2^14
+// bytes; the ciphertext record that carries it is at most 2^14 + 256,
+// which is the room for the inner content type, the padding and the
+// AEAD tag.  A reader that applied the plaintext limit to the wire
+// would refuse a maximal record from a correct peer, and one that
+// applied the ciphertext limit to the plaintext would let a peer push
+// 256 bytes past the buffer the application sized.  Both numbers are
+// public constants and both are checked.
+//
+// A RECORD FULL OF PADDING IS AN ERROR AND NOT AN EMPTY MESSAGE.  If
+// every byte of the decrypted plaintext is zero there is no inner
+// content type, and RFC 8446 § 5.4 says that is an `unexpected_message`
+// alert.  An implementation that answered "zero-length application
+// data" would give a peer a free way to spin a reader that treats a
+// zero-length read as end of stream.
+
+// The number of bytes in a record header: type, legacy version, length.
+pub const TLS_RECORD_HEADER_BYTES = 5
+
+// The largest plaintext fragment one record may carry, RFC 8446 § 5.1.
+pub const TLS_PLAINTEXT_MAX = 16384
+
+// The largest record that may appear on the wire: the plaintext ceiling
+// plus 256 bytes of room for the inner content type, the padding and
+// the AEAD tag.  RFC 8446 § 5.2.
+pub const TLS_CIPHERTEXT_MAX = 16640
+
+// What every TLS 1.3 record writes in the two version bytes, and what a
+// reader must not decide anything from.
+pub const TLS_LEGACY_RECORD_VERSION = 0x0303
+
+// What a record carries, by the number in its header — or, after
+// decryption, by the last non-zero byte of its plaintext.
+pub enum TlsContentKind
+    // Type 20.  TLS 1.3 has no cipher change to signal; a record of
+    // this type is a compatibility artefact that is discarded, and one
+    // that arrives after the handshake is an error rather than a
+    // second discard.
+    TlsChangeCipherSpec
+    // Type 21.  A close, or a failure with a description.
+    TlsAlertContent
+    // Type 22.  Handshake messages, which may span records and share
+    // them.
+    TlsHandshakeContent
+    // Type 23.  Application bytes — and, on the wire after the keys are
+    // in use, every other type as well.
+    TlsAppDataContent
+    // Anything else, kept as the number rather than refused here, so
+    // the refusal happens where the context says what was expected.
+    TlsUnknownContent(code: Int)
+
+// One record's header, and where its fragment starts.
+pub struct TlsRecordHead
+    kind: TlsContentKind
+    // The two legacy version bytes, read so a caller can assert them.
+    // Nothing in this package branches on this field.
+    legacy_version: Int
+    // The fragment's length in bytes, from the header.
+    length: Int
+    // The offset the fragment starts at, in the buffer the header was
+    // read from.
+    fragment_at: Int
+
+// What a reader has, when it does not yet have a whole record.
+pub enum TlsRecordStep
+    // More bytes are needed, and at least this many.
+    TlsRecordNeedBytes(least: Int)
+    // A whole record is available.
+    TlsRecordReady(head: TlsRecordHead)
+
+// The reader between "some bytes turned up" and "here is a record".
+//
+// Opaque: the fields are here because a struct needs them, and a caller
+// that reached into one has coupled itself to a buffering strategy that
+// is going to change.
+pub struct TlsRecordReader
+    buffered: Bytes
+    offset: Int
+    limit: Int
+    closed: Bool
+
+// What a record can be wrong about.
+pub enum TlsRecordFault
+    // A record longer than the ceiling that applies to it, carrying
+    // both numbers so the report says which ceiling.
+    TlsRecordOverLong(length: Int, limit: Int)
+    // A header shorter than five bytes where a whole one was required.
+    TlsRecordUnderLong(have: Int)
+    // The decrypted plaintext was all padding, so it has no inner
+    // content type.  RFC 8446 § 5.4 makes this an error rather than an
+    // empty message.
+    TlsRecordAllPadding
+    // A caller's destination buffer is smaller than the record needs.
+    TlsRecordShortBuffer(need: Int, have: Int)
+    // A record arrived after the reader saw a close.
+    TlsRecordAfterClose
+    // A zero-length fragment, which no record type is allowed to send.
+    TlsRecordEmptyFragment
+
+// The header number for a content type.
+//
+// ```novo
+// use tlsrec
+//
+// fn main() [io]
+//     println("${tlsrec.TLS_RECORD_HEADER_BYTES}")
+// ```
+pub fn kind_code(k: TlsContentKind) -> Int []
+    todo("tls-nv.tlsrec.kind_code")
+
+// The content type a header number names.
+//
+// An unrecognised number becomes `TlsUnknownContent` rather than a
+// refusal, because the record layer does not know what was expected and
+// the state machine does.
+//
+// ```novo
+// use tlsrec
+//
+// fn main() [io]
+//     println("${tlsrec.TLS_PLAINTEXT_MAX}")
+// ```
+pub fn kind_of_code(code: Int) -> TlsContentKind []
+    todo("tls-nv.tlsrec.kind_of_code")
+
+// A reader with the wire ceiling, `TLS_CIPHERTEXT_MAX`.
+pub fn reader() -> TlsRecordReader []
+    todo("tls-nv.tlsrec.reader")
+
+// A reader with a smaller ceiling, for a caller that will not accept
+// maximal records — a device with a 4 KiB buffer, for instance.
+//
+// The ceiling is a refusal and not a truncation: a record larger than
+// it answers `TlsRecordOverLong` carrying both numbers.
+pub fn reader_with(limit: Int) -> TlsRecordReader []
+    todo("tls-nv.tlsrec.reader_with")
+
+// Hand the reader bytes off the wire.
+//
+// The answer says whether a whole record is now available, and the
+// reader keeps whatever is left over for the next call.
+pub fn feed(r: TlsRecordReader, chunk: [u8]) -> Result<TlsRecordStep, TlsRecordFault> []
+    todo("tls-nv.tlsrec.feed")
+
+// Take the record `feed` announced, moving the reader past it.
+pub fn take(r: TlsRecordReader) -> Result<TlsRecordStep, TlsRecordFault> []
+    todo("tls-nv.tlsrec.take")
+
+// How many bytes the reader is holding that are not yet a whole record.
+pub fn pending_len(r: TlsRecordReader) -> Int []
+    todo("tls-nv.tlsrec.pending_len")
+
+// The fragment of the record the reader is positioned on.
+pub fn fragment_of(r: TlsRecordReader, head: TlsRecordHead) -> Bytes []
+    todo("tls-nv.tlsrec.fragment_of")
+
+// Read one header out of a buffer a caller already holds whole.
+//
+// The counterpart of `feed` for the case where the bytes are not
+// arriving in pieces — a test with a recorded transcript, or a caller
+// that reads a fixed five bytes and then the announced length.
+pub fn head_at(src: Bytes, off: Int, limit: Int) -> Result<TlsRecordHead, TlsRecordFault> []
+    todo("tls-nv.tlsrec.head_at")
+
+// Write a record header into a caller's buffer, answering the byte
+// count written.
+//
+// The package writes into a cursor rather than answering `Bytes`
+// because a record header is five bytes in front of a fragment that is
+// already in the caller's buffer, and answering a five-byte value would
+// make every send a copy.
+pub fn write_head_into(kind: TlsContentKind, length: Int,
+                       mut dst: Cursor) -> Result<Int, TlsRecordFault> []
+    todo("tls-nv.tlsrec.write_head_into")
+
+// The REAL content type of a decrypted record: the last non-zero byte
+// of the plaintext.
+//
+// This is the function a reader branches on, and `kind_of_code` reading
+// the header is the one it must not: after the handshake keys are in
+// use every header says `application_data`.
+//
+// All-zero plaintext answers `TlsRecordAllPadding`, which is RFC 8446
+// § 5.4's `unexpected_message` and not an empty message.
+pub fn inner_kind(plaintext: Bytes) -> Result<TlsContentKind, TlsRecordFault> []
+    todo("tls-nv.tlsrec.inner_kind")
+
+// How many bytes of a decrypted record are content, with the inner
+// content type byte and the zero padding behind it removed.
+pub fn inner_len(plaintext: Bytes) -> Result<Int, TlsRecordFault> []
+    todo("tls-nv.tlsrec.inner_len")
+
+// Build the inner plaintext of a record — body, then the content type
+// byte, then `pad` zero bytes — into a caller's buffer.
+//
+// Padding is per record and its length is the caller's choice, because
+// what it hides is a property of the traffic rather than of the
+// protocol: a request whose length identifies which page was fetched is
+// padded by the application that knows that, and this package will not
+// guess a policy on its behalf.
+pub fn pad_into(kind: TlsContentKind, body: Bytes, pad: Int,
+                mut dst: Cursor) -> Result<Int, TlsRecordFault> []
+    todo("tls-nv.tlsrec.pad_into")
+
+// How long the record on the wire will be for a given plaintext,
+// padding and AEAD tag length.
+//
+// A sender asks this before it starts writing, because a record that
+// turned out to exceed `TLS_CIPHERTEXT_MAX` after the tag was appended
+// is one that has to be thrown away and split.
+pub fn ciphertext_len(plaintext_len: Int, pad: Int, tag_len: Int) -> Int []
+    todo("tls-nv.tlsrec.ciphertext_len")
+
+// Whether the two version bytes hold what TLS 1.3 writes.
+//
+// A caller may assert this; this package does not, because a record
+// whose legacy version differs is one that a correct peer behind an
+// unhelpful middlebox may still have sent.
+pub fn is_legacy_version(value: Int) -> Bool []
+    todo("tls-nv.tlsrec.is_legacy_version")
+
+// The ceiling that applies to a record of this content type: the
+// plaintext limit before the keys are in use, the ciphertext limit
+// after.
+pub fn limit_for(kind: TlsContentKind, encrypted: Bool) -> Int []
+    todo("tls-nv.tlsrec.limit_for")
+
+// What went wrong with a record, in one line.
+//
+// The over-long message carries both numbers — the length and the
+// ceiling — because "record too long" without them does not say
+// whether the peer is wrong or the reader's own limit is too small.
+//
+// ```novo ignore
+// use tlsrec
+//
+// fn report(e: TlsRecordFault) -> Str
+//     e.message()
+// ```
+impl Error for TlsRecordFault
+    fn message(self) -> Str
+        todo("tls-nv.tlsrec.TlsRecordFault.message")

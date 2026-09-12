@@ -1,0 +1,217 @@
+// tlssuite.nv — the five cipher suites, the AEAD, and the nonce
+// construction that is not a concatenation.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// THE PER-RECORD NONCE IS AN XOR, NOT A COUNTER APPENDED TO AN IV.
+// RFC 8446 § 5.3: the 64-bit sequence number is written big-endian,
+// left-padded with zeros to the length of the static IV, and XORed with
+// it.  An implementation that concatenated a salt and a counter — which
+// is what TLS 1.2's GCM did, and what every AEAD tutorial shows —
+// produces a nonce that is wrong from the first record and interoperates
+// with nothing.  Worse, if it is wrong in a way that repeats, a repeated
+// nonce under one key is the failure that loses the plaintext of both
+// records and, for a polynomial MAC, the authentication key with them.
+// `record_nonce` is a named function so it can be asserted against RFC
+// 8448's recorded traces.
+//
+// THE SEQUENCE NUMBER IS NOT ON THE WIRE AND IT DOES NOT RESET.  It
+// starts at zero when a key is installed and increments per record; it
+// resets ONLY on a key update, which is the same event as installing a
+// new key.  A sender that reset it on any other boundary reuses a
+// nonce; a receiver that let a peer choose it has given the peer the
+// nonce.
+//
+// THE ASSOCIATED DATA IS THE RECORD HEADER, EXACTLY.  Five bytes: the
+// outer type (always 23), the two frozen legacy version bytes, and the
+// ciphertext length.  TLS 1.2 put the sequence number in the additional
+// data and 1.3 does not, because the nonce already carries it.  An
+// implementation that carried 1.2's habit over authenticates the wrong
+// bytes and fails to open every record a correct peer sends.
+//
+// ONE OF THE FIVE SUITES CAN BE BUILT TODAY.  `suite_is_available`
+// says which, and it is not a placeholder: AES-128-GCM, AES-256-GCM and
+// AES-128-CCM need an AES block cipher, and there is none on the
+// registry — crypto-nv's plan row names AES-GCM as part of its subject
+// and the published 0.1.2 carries SHA-1, SHA-256, SHA-512, MD5 and
+// HMAC and no block cipher at all.  The README's "What is missing"
+// section names the row.  The suites are declared here anyway, because
+// a ClientHello has to be able to OFFER what a server will choose and
+// a ServerHello has to be able to name what a server chose; what is
+// missing is the sealing, not the vocabulary.
+
+// The AEAD and hash pair a connection runs on.
+//
+// The numbers are the registry's, and a suite this package cannot seal
+// with is still one it can name — `suite_is_available` is the question
+// a caller asks before it offers one.
+pub enum TlsCipherSuite
+    // 0x1301.  The suite RFC 8446 § 9.1 says every implementation MUST
+    // offer, and the one this package cannot perform yet.
+    TlsAes128GcmSha256
+    // 0x1302.
+    TlsAes256GcmSha384
+    // 0x1303.  The one suite on this grid with a published primitive
+    // under it.
+    TlsChaCha20Poly1305Sha256
+    // 0x1304.  Constrained-device AES with a 16-byte tag.
+    TlsAes128CcmSha256
+    // A code point this package does not know, kept as the number so a
+    // ClientHello round-trips and the refusal happens where the context
+    // says what was expected.
+    TlsUnknownSuite(code: Int)
+
+// What can go wrong sealing or opening a record.
+pub enum TlsAeadFault
+    // The tag did not match.  There is no detail beyond this on
+    // purpose: a receiver that reported WHERE the plaintext went wrong
+    // has built an oracle.
+    TlsAeadTagMismatch
+    // A caller's destination buffer is smaller than the operation
+    // needs.
+    TlsAeadShortBuffer(need: Int, have: Int)
+    // The sequence number reached its ceiling.  A connection that hits
+    // this must rekey or close; continuing would repeat a nonce.
+    TlsAeadSequenceExhausted(limit: Int)
+    // The suite is one this package can name and cannot perform.  It
+    // carries the suite so a caller can report which primitive is
+    // missing rather than "TLS failed".
+    TlsAeadSuiteUnavailable(suite: TlsCipherSuite)
+    // A ciphertext shorter than the tag it must end with.
+    TlsAeadTruncated(length: Int, tag_len: Int)
+
+// The registry code point for a suite.
+//
+// ```novo ignore
+// use tlssuite
+//
+// fn code() -> Int
+//     tlssuite.suite_code(TlsChaCha20Poly1305Sha256)
+// ```
+pub fn suite_code(s: TlsCipherSuite) -> Int []
+    todo("tls-nv.tlssuite.suite_code")
+
+// The suite a code point names, or `TlsUnknownSuite` carrying the
+// number.
+pub fn suite_of_code(code: Int) -> TlsCipherSuite []
+    todo("tls-nv.tlssuite.suite_of_code")
+
+// The suite's short name, as RFC 8446 spells it — `TLS_AES_128_GCM_SHA256`.
+pub fn suite_name(s: TlsCipherSuite) -> Str []
+    todo("tls-nv.tlssuite.suite_name")
+
+// The hash the suite's key schedule and transcript run on.
+//
+// It is hkdf-nv's `HkdfHash` rather than an enum of this package's own,
+// because every use of it is an argument to hkdf-nv and a second
+// vocabulary for the same hashes would only need converting.
+//
+// `None` FOR THE SHA-384 SUITES, and that is a missing primitive
+// rather than a design choice: hkdf-nv carries SHA-256, SHA-512 and
+// SHA-1, and crypto-nv under it carries the same three plus MD5.
+// There is no SHA-384 on this grid, so `TlsAes256GcmSha384` has no hash
+// to run a key schedule on and `TlsEcdsaP384Sha384` has nothing to
+// digest with.  The README names the row.
+pub fn suite_hash(s: TlsCipherSuite) -> ?HkdfHash []
+    todo("tls-nv.tlssuite.suite_hash")
+
+// The AEAD key length in bytes.
+pub fn suite_key_bytes(s: TlsCipherSuite) -> Int []
+    todo("tls-nv.tlssuite.suite_key_bytes")
+
+// The static IV length in bytes — 12 for every suite here, and the
+// width `record_nonce` XORs the sequence number into.
+pub fn suite_iv_bytes(s: TlsCipherSuite) -> Int []
+    todo("tls-nv.tlssuite.suite_iv_bytes")
+
+// The AEAD tag length in bytes.
+pub fn suite_tag_bytes(s: TlsCipherSuite) -> Int []
+    todo("tls-nv.tlssuite.suite_tag_bytes")
+
+// Whether this package can actually seal and open with the suite
+// today.
+//
+// `true` for `TlsChaCha20Poly1305Sha256` and false for the three AES
+// suites, because the grid has no AES block cipher.  A client that
+// offered a suite it cannot perform and had it chosen would fail the
+// handshake after the server committed, which is a worse failure than
+// not offering it, so `default_suites` answers only what is available
+// and a caller that wants the full list asks for it by name.
+pub fn suite_is_available(s: TlsCipherSuite) -> Bool []
+    todo("tls-nv.tlssuite.suite_is_available")
+
+// The suites a ClientHello offers when the caller says nothing:
+// everything `suite_is_available` answers true for, in preference
+// order.
+pub fn default_suites() -> [TlsCipherSuite] []
+    todo("tls-nv.tlssuite.default_suites")
+
+// Every suite this package can NAME, available or not, for a caller
+// building a ServerHello parser or reporting what a peer offered.
+pub fn known_suites() -> [TlsCipherSuite] []
+    todo("tls-nv.tlssuite.known_suites")
+
+// The per-record nonce: the sequence number written big-endian,
+// left-padded to the IV's length, XORed with the static IV.
+//
+// Not a concatenation.  RFC 8446 § 5.3, and the one construction in
+// this package whose test vectors come from RFC 8448's recorded traces
+// rather than from reasoning.
+pub fn record_nonce(iv: Bytes, sequence: Int, out: Bytes) -> Bytes []
+    todo("tls-nv.tlssuite.record_nonce")
+
+// The additional authenticated data for a record: its five header
+// bytes, and nothing else.
+//
+// TLS 1.2 authenticated the sequence number here; 1.3 does not, because
+// the nonce carries it.  A port that kept 1.2's habit opens nothing.
+pub fn record_aad(kind_code: Int, ciphertext_len: Int) -> Bytes []
+    todo("tls-nv.tlssuite.record_aad")
+
+// Seal one record's inner plaintext into a caller's buffer, answering
+// the number of bytes written — ciphertext and tag together.
+//
+// The plaintext argument is what `tlsrec.pad_into` produced: body,
+// inner content type, padding.
+pub fn seal_into(s: TlsCipherSuite, key: Bytes, iv: Bytes, sequence: Int, aad: Bytes,
+                 plaintext: Bytes, mut dst: Cursor) -> Result<Int, TlsAeadFault> []
+    todo("tls-nv.tlssuite.seal_into")
+
+// Open one record into a caller's buffer, answering the plaintext
+// length.
+//
+// A tag mismatch is `TlsAeadTagMismatch` and carries nothing else; the
+// caller's only correct response is a `bad_record_mac` alert and a
+// closed connection, because a receiver that retried or reported detail
+// is a receiver a peer can question.
+pub fn open_into(s: TlsCipherSuite, key: Bytes, iv: Bytes, sequence: Int, aad: Bytes,
+                 ciphertext: Bytes, mut dst: Cursor) -> Result<Int, TlsAeadFault> []
+    todo("tls-nv.tlssuite.open_into")
+
+// How many records may be sent under one key before a key update is
+// required.
+//
+// A limit rather than an exhortation: `seal_into` answers
+// `TlsAeadSequenceExhausted` past it rather than wrapping the sequence
+// number, because a wrapped sequence number repeats a nonce and a
+// repeated nonce under a polynomial MAC hands over the authentication
+// key.
+pub fn sequence_limit(s: TlsCipherSuite) -> Int []
+    todo("tls-nv.tlssuite.sequence_limit")
+
+// What went wrong with an AEAD operation, in one line.
+//
+// The tag-mismatch line says only that.  Everything a receiver could
+// add — which byte, which record, how far in — is a measurement an
+// attacker gets to repeat.
+//
+// ```novo ignore
+// use tlssuite
+//
+// fn report(e: TlsAeadFault) -> Str
+//     e.message()
+// ```
+impl Error for TlsAeadFault
+    fn message(self) -> Str
+        todo("tls-nv.tlssuite.TlsAeadFault.message")

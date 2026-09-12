@@ -1,0 +1,283 @@
+// tlskey.nv — RFC 8446 § 7.1's key schedule: the transcript hash, the
+// labelled expansion, and the ladder of secrets both peers have to
+// climb identically or fail a Finished with no way to say why.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`, and every input that would need a clock or a
+// random number is an argument.
+//
+// HKDF-EXPAND-LABEL IS NOT HKDF-EXPAND.  RFC 8446 § 7.1 puts a
+// STRUCTURE in the `info` field: a two-byte output length, a
+// length-prefixed label that is the string "tls13 " followed by the
+// label proper, and a length-prefixed context.  An implementation that
+// passed the bare label bytes to hkdf-nv's `expand` gets a key that is
+// uniformly random, passes every self-test, and interoperates with
+// nothing — and the failure surfaces as a Finished mismatch four
+// messages later.  `hkdf_expand_label` is the only way this package
+// derives anything, and RFC 8448's traces are its vectors.
+//
+// DERIVE-SECRET HASHES THE TRANSCRIPT SO FAR, AND SOMETIMES THE EMPTY
+// ONE.  The two `derived` steps between the secrets in the ladder use
+// the hash of the EMPTY message sequence, not of the transcript at that
+// point.  A port that passed the running transcript to all of them
+// derives a handshake secret nobody else has.
+//
+// THE TRANSCRIPT IS REWRITTEN BY A HELLORETRYREQUEST.  When one
+// arrives, the first ClientHello is removed from the transcript and
+// replaced by a synthetic `message_hash` message that carries its hash
+// — type 254, a four-byte header, then the digest.  Appending
+// ClientHello1, HelloRetryRequest, ClientHello2 in the obvious order
+// gives a transcript that differs from the peer's from that point on.
+// `transcript_replace` is that operation, and it exists as a named
+// function because it is not something a caller would think to do.
+//
+// THE FINISHED COMPARISON IS THE ONE AN ATTACKER GETS TO ITERATE.
+// `finished_verify` answers the expected value and `finished_matches`
+// is the comparison, and the comparison is crypto-nv's `digest.ct_eq`
+// rather than `==`.  A byte-at-a-time comparison over a value the peer
+// supplies is a timing oracle for the value itself.
+//
+// KEY UPDATE IS A ONE-WAY RATCHET AND IT RESETS THE SEQUENCE NUMBER.
+// `update_traffic_secret` derives the next secret from the current one
+// with the "traffic upd" label; the old secret cannot be recovered from
+// the new one, which is the point.  The sequence number goes back to
+// zero with the new key — `tlssuite.record_nonce` is computed from the
+// new pair — and an implementation that kept counting produces nonces
+// its peer will not reproduce.
+
+use tlssuite
+
+// Every label prefix RFC 8446 puts in front of a derivation.
+pub const TLS_LABEL_PREFIX = "tls13 "
+
+// The synthetic message type a HelloRetryRequest transcript rewrite
+// uses.
+pub const TLS_MESSAGE_HASH_TYPE = 254
+
+// The running hash of every handshake message sent and received, in
+// order.
+//
+// Opaque: a caller that reached inside has coupled itself to whether
+// the hash is kept incrementally or as a buffer, and the answer will
+// change.
+pub struct TlsTranscript
+    hash: HkdfHash
+    state: Bytes
+    length: Int
+
+// Where the ladder currently stands.
+//
+// One value rather than eight loose byte arrays, because the order the
+// steps happen in is the thing that is easy to get wrong and a value
+// that carries its own stage can refuse a step taken out of turn.
+pub struct TlsSecrets
+    hash: HkdfHash
+    early: Bytes
+    handshake: Bytes
+    master: Bytes
+    client_traffic: Bytes
+    server_traffic: Bytes
+    stage: Int
+
+// The key and IV a direction seals with, and the sequence number that
+// goes with them.
+//
+// The sequence number is here rather than beside the socket because it
+// is a property of the KEY: installing a new key resets it, and keeping
+// the two together is what makes that impossible to forget.
+pub struct TlsTrafficKeys
+    key: Bytes
+    iv: Bytes
+    sequence: Int
+
+// What can go wrong deriving a key.
+pub enum TlsKeyFault
+    // A caller's output buffer is the wrong size for the derivation.
+    TlsKeyShortOutput(need: Int, have: Int)
+    // A label longer than the one-byte length field it is written with
+    // allows.
+    TlsKeyLabelTooLong(length: Int)
+    // A ladder step taken before the one it depends on.
+    TlsKeyOutOfOrder(wanted: Str, at: Str)
+    // hkdf-nv refused the derivation; the reason is its own.
+    TlsKeyExpandRefused(reason: Str)
+    // A transcript rewrite asked for on a transcript that has no
+    // ClientHello in it.
+    TlsKeyNoTranscriptToReplace
+
+// A fresh transcript for a hash.
+pub fn transcript(h: HkdfHash) -> TlsTranscript []
+    todo("tls-nv.tlskey.transcript")
+
+// Add one whole handshake message — header included — to the
+// transcript.
+//
+// Header included, because the transcript is over the messages as they
+// appear in the handshake stream and not over their bodies.  An
+// implementation that fed bodies computes a Finished nobody agrees
+// with.
+pub fn transcript_update(t: TlsTranscript, message: Bytes) -> TlsTranscript []
+    todo("tls-nv.tlskey.transcript_update")
+
+// The transcript hash as it stands.
+pub fn transcript_hash(t: TlsTranscript, out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.transcript_hash")
+
+// How many messages the transcript has absorbed.
+pub fn transcript_len(t: TlsTranscript) -> Int []
+    todo("tls-nv.tlskey.transcript_len")
+
+// Replace everything absorbed so far with the synthetic `message_hash`
+// message RFC 8446 § 4.4.1 requires after a HelloRetryRequest.
+//
+// The transcript afterwards is `message_hash || HelloRetryRequest ||
+// ClientHello2`, which is what the server computed.  Appending in the
+// obvious order instead gives a different value from the second message
+// on.
+pub fn transcript_replace(t: TlsTranscript) -> Result<TlsTranscript, TlsKeyFault> []
+    todo("tls-nv.tlskey.transcript_replace")
+
+// The hash of an empty message sequence, which is what the two
+// `derived` steps in the ladder take as their context.
+pub fn empty_transcript_hash(h: HkdfHash, out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.empty_transcript_hash")
+
+// HKDF-Expand-Label: the structured `info` RFC 8446 § 7.1 defines, and
+// the only expansion this package performs.
+//
+// The label argument is the label PROPER — "key", "iv", "finished" —
+// and the "tls13 " prefix is added here, so a caller cannot half-apply
+// it.
+pub fn hkdf_expand_label(h: HkdfHash, secret: Bytes, label: Str, context: Bytes,
+                         out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.hkdf_expand_label")
+
+// Derive-Secret: `hkdf_expand_label` with a transcript hash as the
+// context and the hash's own length as the output.
+pub fn derive_secret(h: HkdfHash, secret: Bytes, label: Str, t: TlsTranscript,
+                     out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.derive_secret")
+
+// A ladder with nothing derived yet.
+pub fn schedule(h: HkdfHash) -> TlsSecrets []
+    todo("tls-nv.tlskey.schedule")
+
+// The early secret: extract with the pre-shared key, or with a string
+// of zeros when there is none.
+//
+// Zeros and not an absent salt: a handshake without a PSK still climbs
+// the same ladder, and skipping the step gives a different master
+// secret.
+pub fn with_psk(s: TlsSecrets, psk: Bytes) -> Result<TlsSecrets, TlsKeyFault> []
+    todo("tls-nv.tlskey.with_psk")
+
+// The early secret with no pre-shared key.
+pub fn without_psk(s: TlsSecrets) -> Result<TlsSecrets, TlsKeyFault> []
+    todo("tls-nv.tlskey.without_psk")
+
+// Fold the key-exchange output in, giving the handshake secret.
+//
+// The shared secret is an ARGUMENT: the Diffie-Hellman is x25519-nv's
+// or p256-nv's and belongs to whoever holds the private key, which for
+// a device with a secure element is not this package.
+pub fn with_shared_secret(s: TlsSecrets, shared: Bytes) -> Result<TlsSecrets, TlsKeyFault> []
+    todo("tls-nv.tlskey.with_shared_secret")
+
+// Derive the two handshake traffic secrets from the transcript through
+// the ServerHello.
+pub fn advance_to_handshake(s: TlsSecrets, t: TlsTranscript) -> Result<TlsSecrets, TlsKeyFault> []
+    todo("tls-nv.tlskey.advance_to_handshake")
+
+// Derive the master secret and the two application traffic secrets from
+// the transcript through the server's Finished.
+//
+// THROUGH THE SERVER'S FINISHED, not through the client's: the
+// application keys are fixed before the client has spoken, which is
+// what lets a server send application data immediately after its own
+// Finished.  A port that waited for the client's Finished derives keys
+// from a longer transcript and decrypts nothing.
+pub fn advance_to_application(s: TlsSecrets, t: TlsTranscript) -> Result<TlsSecrets, TlsKeyFault> []
+    todo("tls-nv.tlskey.advance_to_application")
+
+// The handshake traffic secret for one side.
+pub fn handshake_secret_of(s: TlsSecrets, role: TlsRole) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.handshake_secret_of")
+
+// The application traffic secret for one side.
+pub fn traffic_secret_of(s: TlsSecrets, role: TlsRole) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.traffic_secret_of")
+
+// Expand a traffic secret into the key, the IV and a sequence number of
+// zero.
+//
+// Zero, always: a new key is a new sequence space, and a value that
+// carried the old count would repeat a nonce on the first record.
+pub fn traffic_keys(h: HkdfHash, secret: Bytes,
+                    s: TlsCipherSuite) -> Result<TlsTrafficKeys, TlsKeyFault> []
+    todo("tls-nv.tlskey.traffic_keys")
+
+// The next sequence number, or `TlsKeyFault` at the suite's ceiling.
+pub fn next_sequence(k: TlsTrafficKeys, s: TlsCipherSuite) -> Result<TlsTrafficKeys, TlsKeyFault> []
+    todo("tls-nv.tlskey.next_sequence")
+
+// The key a Finished message's HMAC is taken under.
+pub fn finished_key(h: HkdfHash, traffic_secret: Bytes, out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.finished_key")
+
+// The verify_data a Finished message should carry, given the transcript
+// at that point.
+pub fn finished_verify(h: HkdfHash, finished_key: Bytes, t: TlsTranscript,
+                       out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.finished_verify")
+
+// Whether a peer's Finished matches, compared in constant time.
+//
+// crypto-nv's `digest.ct_eq` and not `==`.  The peer chooses the value
+// on one side of this comparison, and a comparison that stops at the
+// first differing byte tells them how much of it was right.
+pub fn finished_matches(expected: Bytes, received: Bytes) -> Bool []
+    todo("tls-nv.tlskey.finished_matches")
+
+// The resumption master secret a ticket's PSK is derived from.
+pub fn resumption_secret(s: TlsSecrets, t: TlsTranscript,
+                         out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.resumption_secret")
+
+// The pre-shared key a ticket and its nonce name.
+pub fn ticket_psk(h: HkdfHash, resumption_secret: Bytes, nonce: Bytes,
+                  out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.ticket_psk")
+
+// The next traffic secret in the ratchet, for a KeyUpdate.
+//
+// One way: the old secret cannot be recovered from the new one, so an
+// attacker who takes the key out of a running process cannot read what
+// was sent before they arrived.
+pub fn update_traffic_secret(h: HkdfHash, secret: Bytes,
+                             out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.update_traffic_secret")
+
+// RFC 8446 § 7.5's exporter: a key for a protocol layered on top of
+// this connection, bound to it.
+//
+// What DTLS-SRTP and channel binding use, and the only supported way to
+// get key material out of a finished connection.
+pub fn exporter(s: TlsSecrets, t: TlsTranscript, label: Str, context: Bytes,
+                out: Bytes) -> Result<Bytes, TlsKeyFault> []
+    todo("tls-nv.tlskey.exporter")
+
+// What went wrong deriving a key, in one line.
+//
+// The out-of-order message names both the step asked for and the step
+// the ladder is on, because that is a programming error in the caller
+// and the two names are the fix.
+//
+// ```novo ignore
+// use tlskey
+//
+// fn report(e: TlsKeyFault) -> Str
+//     e.message()
+// ```
+impl Error for TlsKeyFault
+    fn message(self) -> Str
+        todo("tls-nv.tlskey.TlsKeyFault.message")

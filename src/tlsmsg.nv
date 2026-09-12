@@ -1,0 +1,491 @@
+// tlsmsg.nv — handshake messages and extensions: the values a TLS 1.3
+// conversation is made of, and the three fields that do not mean what
+// they are named.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// THE VERSION IS NOT IN THE VERSION FIELD.  `ClientHello.legacy_version`
+// and `ServerHello.legacy_version` both say 0x0303 — TLS 1.2 — on every
+// 1.3 handshake, and the real answer is the `supported_versions`
+// extension.  A client that read the legacy field concludes it is
+// speaking 1.2 to a 1.3 server and derives every key with the wrong
+// schedule.  `selected_version` reads the extension and there is no
+// accessor for the legacy field, because there is no correct use for
+// one.
+//
+// A HELLORETRYREQUEST IS A SERVERHELLO WITH A CONSTANT IN ITS RANDOM.
+// RFC 8446 § 4.1.3 defines it as a ServerHello whose 32 random bytes
+// are a fixed SHA-256 value, not as a message type of its own.  A
+// client that treated it as a ServerHello installs handshake keys from
+// a key share the server did not send and then fails a Finished it has
+// no way to diagnose.  `is_hello_retry_request` is the check, and it is
+// separate from parsing because the parse succeeds either way.
+//
+// AND THE TRANSCRIPT IS REWRITTEN WHEN ONE ARRIVES.  After a
+// HelloRetryRequest the transcript is not "ClientHello1, HRR,
+// ClientHello2": the first ClientHello is REPLACED by a synthetic
+// `message_hash` message carrying its hash.  An implementation that
+// appended in the obvious order computes a different Finished from its
+// peer and cannot tell why.  `tlskey.transcript_replace` is the other
+// half of that, and the two are named for each other.
+//
+// THE CERTIFICATEVERIFY CONTEXT STRING IS DIFFERENT IN EACH DIRECTION.
+// The signed content is 64 spaces, then a label, then a zero byte, then
+// the transcript hash — and the label is "TLS 1.3, server
+// CertificateVerify" from a server and "TLS 1.3, client
+// CertificateVerify" from a client.  The 64 spaces are there so that a
+// signature made by a TLS 1.3 peer cannot be replayed into a protocol
+// that signs a bare hash, and the differing labels are there so that a
+// server's signature cannot be replayed as a client's.  `verify_context`
+// takes the role for exactly that reason and there is no default.
+
+// Which side of the connection a value belongs to.
+//
+// It lives in this module rather than in `tlshs` because the first
+// thing that needs it is `verify_context`, and a signature that used
+// the wrong side's label is the reason that function takes a role at
+// all.
+pub enum TlsRole
+    TlsClientRole
+    TlsServerRole
+
+// A handshake message's type byte.
+pub enum TlsMsgKind
+    TlsClientHelloKind
+    TlsServerHelloKind
+    TlsNewSessionTicketKind
+    TlsEndOfEarlyDataKind
+    TlsEncryptedExtensionsKind
+    TlsCertificateKind
+    TlsCertificateRequestKind
+    TlsCertificateVerifyKind
+    TlsFinishedKind
+    TlsKeyUpdateKind
+    // A type byte this package does not know, kept as the number so the
+    // refusal happens in the state machine, where what was expected is
+    // known.
+    TlsUnknownMsgKind(code: Int)
+
+// A key-exchange group.
+pub enum TlsNamedGroup
+    // 0x001d.  What TLS 1.3 deployments actually use, and the group
+    // this package's default offer names first.
+    TlsX25519Group
+    // 0x0017.  secp256r1, for the deployments a compliance rule sends
+    // to a NIST curve.
+    TlsSecp256r1Group
+    // 0x0018.  secp384r1 — named so a ClientHello can round-trip; there
+    // is no P-384 on the grid.
+    TlsSecp384r1Group
+    TlsUnknownGroup(code: Int)
+
+// A signature algorithm, as the `signature_algorithms` extension and
+// the CertificateVerify message spell it.
+pub enum TlsSigScheme
+    // 0x0403.  ECDSA over P-256 with SHA-256.
+    TlsEcdsaP256Sha256
+    // 0x0503.
+    TlsEcdsaP384Sha384
+    // 0x0804.  RSASSA-PSS with an rsaEncryption key — what the public
+    // web's certificates are still mostly signed with.
+    TlsRsaPssRsaeSha256
+    // 0x0805.
+    TlsRsaPssRsaeSha384
+    // 0x0807.
+    TlsEd25519Sig
+    TlsUnknownSigScheme(code: Int)
+
+// An extension's type number.
+pub enum TlsExtKind
+    TlsServerNameExt
+    TlsSupportedGroupsExt
+    TlsSignatureAlgorithmsExt
+    TlsAlpnExt
+    // Where the version actually is.
+    TlsSupportedVersionsExt
+    TlsKeyShareExt
+    TlsPreSharedKeyExt
+    TlsPskKeyExchangeModesExt
+    TlsUnknownExt(code: Int)
+
+// One extension, kept as its type and its body.
+//
+// The body is bytes rather than a parsed union because an extension
+// this package does not know has to round-trip through a ClientHello
+// unchanged, and because a caller that needs one this package does not
+// parse can parse it without a fork.
+pub struct TlsExtension
+    kind: TlsExtKind
+    body: Bytes
+
+// One offered or selected key share.
+pub struct TlsKeyShareEntry
+    group: TlsNamedGroup
+    // The public key, in the group's own wire encoding: 32 bytes for
+    // X25519, an uncompressed point for the NIST curves.
+    key_exchange: Bytes
+
+// A ClientHello, with the fields a 1.3 handshake reads lifted out of
+// the extension list they arrive in.
+//
+// `extensions` still holds every extension including the lifted ones,
+// so a server that has to echo or inspect one this package does not
+// model can, and so a ClientHello round-trips byte for byte.
+pub struct TlsClientHello
+    // 32 bytes.  An argument to `tlshs.client` rather than something
+    // this module generates, which is what keeps the row `[]` and makes
+    // a handshake reproducible against RFC 8448's traces.
+    random: Bytes
+    // The compatibility session id.  Non-empty makes a 1.3 handshake
+    // look like a 1.2 resumption to a middlebox; empty is also legal.
+    legacy_session_id: Bytes
+    suites: [TlsCipherSuite]
+    // The SNI host, or `""` when none was sent.  An IP address is never
+    // put here — RFC 6066 § 3 forbids it — and `server_name_of` answers
+    // `None` rather than inventing one.
+    server_name: Str
+    groups: [TlsNamedGroup]
+    schemes: [TlsSigScheme]
+    key_shares: [TlsKeyShareEntry]
+    // Offered protocols in preference order; empty offers none.
+    alpn: [Str]
+    extensions: [TlsExtension]
+
+// A ServerHello — or a HelloRetryRequest, which is one of these with a
+// constant in `random`.
+pub struct TlsServerHello
+    random: Bytes
+    legacy_session_id_echo: Bytes
+    suite: TlsCipherSuite
+    // The server's key share, absent in a HelloRetryRequest, which
+    // names a group instead.
+    key_share: ?TlsKeyShareEntry
+    // The group a HelloRetryRequest asks the client to retry with.
+    retry_group: ?TlsNamedGroup
+    // The index into the client's offered identities when a PSK was
+    // accepted.
+    selected_psk: ?Int
+    extensions: [TlsExtension]
+
+// One certificate in a chain, with the per-entry extensions TLS 1.3
+// allows beside it.
+pub struct TlsCertEntry
+    // DER.  Unparsed here: `tlscert` is the only module that reads
+    // inside a certificate, and it does it through asn1-nv.
+    cert: Bytes
+    extensions: [TlsExtension]
+
+// The Certificate message.
+pub struct TlsCertificateMsg
+    // Empty from a server; a client answering a CertificateRequest
+    // echoes the request's context here, and an implementation that
+    // sent an empty one has its certificate refused.
+    request_context: Bytes
+    // Leaf first, then the issuers in order.  RFC 8446 § 4.4.2 no
+    // longer requires the order to be a valid chain, which is why
+    // `tlscert.verify_chain` builds the path rather than walking the
+    // list.
+    entries: [TlsCertEntry]
+
+// The CertificateVerify message.
+pub struct TlsCertVerifyMsg
+    scheme: TlsSigScheme
+    signature: Bytes
+
+// A NewSessionTicket, which arrives AFTER the handshake is finished and
+// is not part of it.
+pub struct TlsTicket
+    // Seconds, capped at a week by the specification.
+    lifetime: Int
+    // The obfuscation offset a client adds to the ticket's age before
+    // sending it back, so a passive observer cannot correlate two
+    // connections by age alone.
+    age_add: Int
+    nonce: Bytes
+    ticket: Bytes
+    // 0 when the server offered no early data — which is what this
+    // package always sends, because it does not do 0-RTT.
+    max_early_data: Int
+
+// The ceilings a message parse is held to.
+//
+// Public and constructed by the caller because an embedded consumer and
+// a public-web client want different numbers, and because a parser
+// whose limits are compiled in is one a device has to fork.
+pub struct TlsMsgLimits
+    max_message_bytes: Int
+    max_extensions: Int
+    max_certificates: Int
+    max_alpn_protocols: Int
+    max_key_shares: Int
+
+// What a handshake message can be wrong about.
+pub enum TlsMsgFault
+    // The message ended before its declared length.
+    TlsMsgTruncated(at: Int)
+    // A length field that does not agree with the bytes around it.
+    TlsMsgBadLength(at: Int, declared: Int, available: Int)
+    // A message longer than `TlsMsgLimits` allows.
+    TlsMsgOverLong(length: Int, limit: Int)
+    // A count past one of the limits, carrying both numbers.
+    TlsMsgTooMany(what: Str, count: Int, limit: Int)
+    // The same extension appeared twice, which RFC 8446 § 4.2 forbids
+    // and which is how a parser that kept the last one gets a different
+    // answer from a parser that kept the first.
+    TlsMsgDuplicateExtension(kind: TlsExtKind)
+    // An extension appeared in a message it is not allowed in.
+    TlsMsgExtensionNotAllowed(kind: TlsExtKind)
+    // A required extension was absent — `supported_versions` in a
+    // ServerHello, for instance, whose absence means the peer is not
+    // speaking 1.3 at all.
+    TlsMsgExtensionMissing(kind: TlsExtKind)
+    // A ServerHello that named a version other than 1.3.
+    TlsMsgUnsupportedVersion(version: Int)
+    // A message type where another was required.
+    TlsMsgUnexpected(saw: TlsMsgKind)
+
+// The message type byte for a kind.
+pub fn msg_kind_code(k: TlsMsgKind) -> Int []
+    todo("tls-nv.tlsmsg.msg_kind_code")
+
+// The kind a message type byte names.
+pub fn msg_kind_of_code(code: Int) -> TlsMsgKind []
+    todo("tls-nv.tlsmsg.msg_kind_of_code")
+
+// The registry code point for a group.
+pub fn group_code(g: TlsNamedGroup) -> Int []
+    todo("tls-nv.tlsmsg.group_code")
+
+// The group a code point names.
+pub fn group_of_code(code: Int) -> TlsNamedGroup []
+    todo("tls-nv.tlsmsg.group_of_code")
+
+// How many bytes a public key in this group occupies on the wire.
+pub fn group_key_bytes(g: TlsNamedGroup) -> Int []
+    todo("tls-nv.tlsmsg.group_key_bytes")
+
+// Whether this package can actually perform the key exchange.
+//
+// True for X25519 and secp256r1, which x25519-nv and p256-nv carry;
+// false for secp384r1, which nothing on the grid does.  A client offers
+// only groups it can complete, for the same reason it offers only
+// suites it can seal with.
+pub fn group_is_available(g: TlsNamedGroup) -> Bool []
+    todo("tls-nv.tlsmsg.group_is_available")
+
+// The groups a ClientHello offers when the caller says nothing.
+pub fn default_groups() -> [TlsNamedGroup] []
+    todo("tls-nv.tlsmsg.default_groups")
+
+// The registry code point for a signature scheme.
+pub fn scheme_code(s: TlsSigScheme) -> Int []
+    todo("tls-nv.tlsmsg.scheme_code")
+
+// The scheme a code point names.
+pub fn scheme_of_code(code: Int) -> TlsSigScheme []
+    todo("tls-nv.tlsmsg.scheme_of_code")
+
+// The schemes a ClientHello advertises when the caller says nothing.
+//
+// A client advertises what it can VERIFY, which is a different set from
+// what it can sign: a client with no certificate signs nothing and must
+// still name every scheme a server's certificate might carry, or the
+// server has nothing to choose.
+pub fn default_schemes() -> [TlsSigScheme] []
+    todo("tls-nv.tlsmsg.default_schemes")
+
+// The registry code point for an extension kind.
+pub fn ext_kind_code(k: TlsExtKind) -> Int []
+    todo("tls-nv.tlsmsg.ext_kind_code")
+
+// The extension kind a code point names.
+pub fn ext_kind_of_code(code: Int) -> TlsExtKind []
+    todo("tls-nv.tlsmsg.ext_kind_of_code")
+
+// The first extension of a kind, or `None`.
+//
+// There is no "all of a kind" accessor, because a duplicate extension
+// is `TlsMsgDuplicateExtension` at parse time and never reaches here.
+pub fn extension_by_kind(exts: [TlsExtension], k: TlsExtKind) -> ?TlsExtension []
+    todo("tls-nv.tlsmsg.extension_by_kind")
+
+// Limits a public-web client is comfortable with.
+pub fn default_limits() -> TlsMsgLimits []
+    todo("tls-nv.tlsmsg.default_limits")
+
+// Limits small enough for a device: one key share, four certificates,
+// and a message ceiling that fits a 16 KiB record.
+pub fn embedded_limits() -> TlsMsgLimits []
+    todo("tls-nv.tlsmsg.embedded_limits")
+
+// Read a handshake message's type and length out of its first four
+// bytes, answering the kind and the body's length.
+//
+// A handshake message may span records and several may share one, so
+// this reads a byte stream the record layer produced rather than a
+// record.
+pub fn msg_head_at(src: Bytes, off: Int,
+                   limits: TlsMsgLimits) -> Result<(TlsMsgKind, Int), TlsMsgFault> []
+    todo("tls-nv.tlsmsg.msg_head_at")
+
+// Parse a ClientHello body.
+pub fn parse_client_hello(body: Bytes,
+                          limits: TlsMsgLimits) -> Result<TlsClientHello, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_client_hello")
+
+// Parse a ServerHello body — which may be a HelloRetryRequest, and
+// `is_hello_retry_request` is how a caller finds out.
+pub fn parse_server_hello(body: Bytes,
+                          limits: TlsMsgLimits) -> Result<TlsServerHello, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_server_hello")
+
+// Parse an EncryptedExtensions body, which is an extension list and
+// nothing else.
+pub fn parse_encrypted_extensions(body: Bytes,
+                                  limits: TlsMsgLimits) -> Result<[TlsExtension], TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_encrypted_extensions")
+
+// Parse a Certificate body.
+pub fn parse_certificate(body: Bytes,
+                         limits: TlsMsgLimits) -> Result<TlsCertificateMsg, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_certificate")
+
+// Parse a CertificateVerify body.
+pub fn parse_certificate_verify(body: Bytes,
+                                limits: TlsMsgLimits) -> Result<TlsCertVerifyMsg, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_certificate_verify")
+
+// Parse a Finished body, which is one verify_data field whose length is
+// the hash's and is not on the wire.
+pub fn parse_finished(body: Bytes, hash_len: Int) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_finished")
+
+// Parse a NewSessionTicket body.
+pub fn parse_ticket(body: Bytes, limits: TlsMsgLimits) -> Result<TlsTicket, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_ticket")
+
+// Parse a KeyUpdate body: whether the peer wants one back.
+//
+// The answer is a `Bool` and not an enum because the message has
+// exactly two values and the one that matters is "and you update too",
+// which is the half a naive implementation drops and then cannot
+// decrypt what follows.
+pub fn parse_key_update(body: Bytes) -> Result<Bool, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.parse_key_update")
+
+// Write a ClientHello, header included.
+pub fn write_client_hello(ch: TlsClientHello) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.write_client_hello")
+
+// Write a ServerHello, header included.
+pub fn write_server_hello(sh: TlsServerHello) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.write_server_hello")
+
+// Write an EncryptedExtensions message.
+pub fn write_encrypted_extensions(exts: [TlsExtension]) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.write_encrypted_extensions")
+
+// Write a Certificate message.
+pub fn write_certificate(m: TlsCertificateMsg) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.write_certificate")
+
+// Write a CertificateVerify message.
+pub fn write_certificate_verify(m: TlsCertVerifyMsg) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.write_certificate_verify")
+
+// Write a Finished message around a verify_data value.
+pub fn write_finished(verify_data: Bytes) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.write_finished")
+
+// Write a KeyUpdate message.
+pub fn write_key_update(request_reply: Bool) -> Result<Bytes, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.write_key_update")
+
+// Whether this ServerHello is a HelloRetryRequest.
+//
+// The test is the 32 random bytes against RFC 8446 § 4.1.3's constant,
+// compared in full.  A client that skipped it installs keys from a key
+// share the server did not send.
+pub fn is_hello_retry_request(sh: TlsServerHello) -> Bool []
+    todo("tls-nv.tlsmsg.is_hello_retry_request")
+
+// The 32-byte constant that marks a HelloRetryRequest, for a caller
+// writing one.
+pub fn hello_retry_random() -> Bytes []
+    todo("tls-nv.tlsmsg.hello_retry_random")
+
+// The version the peer actually selected, out of `supported_versions`.
+//
+// There is no accessor for the legacy version field.  A ServerHello
+// with no `supported_versions` extension is a peer that is not speaking
+// 1.3, and that is `TlsMsgExtensionMissing` rather than a version
+// number a caller might act on.
+pub fn selected_version(sh: TlsServerHello) -> Result<Int, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.selected_version")
+
+// The SNI host a ClientHello carried, or `None`.
+//
+// `None` and not `""` for a hello with no SNI, because a server that
+// treated the two the same serves its default certificate to a client
+// that asked for a name it does not have.
+pub fn server_name_of(ch: TlsClientHello) -> ?Str []
+    todo("tls-nv.tlsmsg.server_name_of")
+
+// Pick an ALPN protocol: the first of the server's supported list that
+// the client offered.
+//
+// The SERVER's order wins, which is RFC 7301 § 3.2's rule and the
+// opposite of what reading the client's list left to right gives.  A
+// server that let the client choose has let the client downgrade it to
+// whichever protocol it handles worst.
+pub fn alpn_pick(offered: [Str], supported: [Str]) -> ?Str []
+    todo("tls-nv.tlsmsg.alpn_pick")
+
+// The content a CertificateVerify signature is over: 64 spaces, the
+// role's label, a zero byte, then the transcript hash.
+//
+// The role is an argument and there is no default, because the two
+// labels differ precisely so that a server's signature cannot be
+// replayed as a client's — and a function that guessed would be a
+// function that could guess wrong in the direction that costs
+// something.
+pub fn verify_context(role: TlsRole, transcript_hash: Bytes) -> Bytes []
+    todo("tls-nv.tlsmsg.verify_context")
+
+// Build a `server_name` extension.
+pub fn server_name_extension(host: Str) -> Result<TlsExtension, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.server_name_extension")
+
+// Build an `application_layer_protocol_negotiation` extension.
+pub fn alpn_extension(protocols: [Str]) -> Result<TlsExtension, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.alpn_extension")
+
+// Build a `key_share` extension from the entries a caller generated.
+pub fn key_share_extension(entries: [TlsKeyShareEntry]) -> Result<TlsExtension, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.key_share_extension")
+
+// Build the `supported_versions` extension that says TLS 1.3 and
+// nothing else.
+//
+// Nothing else, on purpose: offering 1.2 beside it is what makes a
+// downgrade something a middlebox can force, and this package does not
+// implement 1.2 to fall back to.
+pub fn supported_versions_extension(role: TlsRole) -> Result<TlsExtension, TlsMsgFault> []
+    todo("tls-nv.tlsmsg.supported_versions_extension")
+
+// What went wrong with a handshake message, in one line.
+//
+// A duplicate or misplaced extension names the extension, because
+// "malformed ClientHello" against a real peer is a report nobody can
+// act on.
+//
+// ```novo ignore
+// use tlsmsg
+//
+// fn report(e: TlsMsgFault) -> Str
+//     e.message()
+// ```
+impl Error for TlsMsgFault
+    fn message(self) -> Str
+        todo("tls-nv.tlsmsg.TlsMsgFault.message")

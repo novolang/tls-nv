@@ -1,0 +1,92 @@
+[package]
+name        = "tls-nv"
+version     = "0.0.1"
+description = "Native TLS 1.3 (RFC 8446): the record layer, the handshake message codec, the key schedule, certificate chain validation over a caller-supplied root store, and a client and server handshake state machine that performs nothing — the host pumps it with `TlsAction`s.  The connection half sits over std.net and answers the shape std.tls already has, so this week's clients can pass it as their TLS hook.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and SIX OF THE SEVEN MODULES DECLARE NOTHING.  `tlsrec`,
+# `tlsmsg`, `tlssuite`, `tlskey`, `tlscert` and `tlshs` are `[]`
+# throughout: the record framing, the handshake messages, the AEAD
+# arithmetic, RFC 8446 § 7.1's key schedule, chain validation and the
+# handshake state machine itself are all functions from bytes and
+# values to bytes and values.  What performs is `tlsconn` — `[net]` for
+# the socket, `[time]` for the one clock read a certificate's validity
+# window needs, and `[fs]` for the one function that reads the
+# platform's trust store off disk.
+#
+# `layer = "host"` AND NOT `layer = "core"` WITH `host_modules`.  The
+# README argues the `tls-core-nv` row those six modules would move to
+# and recommends taking it; until that row exists, declaring `core`
+# here would advertise a `core` package whose subject — a TLS
+# connection over a socket — is not one a `core` consumer can have.
+layer       = "host"
+
+category    = "crypto"
+
+tags        = ["tls", "tls13", "rfc8446", "handshake", "sans-io", "x509", "certificates"]
+repository  = "https://github.com/novolang/tls-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A TLS 1.3 connection, and the state machine under it"
+
+[dependencies]
+# HKDF-Extract and HKDF-Expand, which the whole of RFC 8446 § 7.1 is
+# built from.  `tlskey.hkdf_expand_label` is the structured wrapper the
+# specification puts over `expand`, and getting that structure wrong is
+# the failure this package's key-schedule tests exist to catch.
+hkdf-nv = "^0.0.1"
+
+# SHA-256 and SHA-384 for the transcript hash and, through hkdf-nv, for
+# HMAC; `digest.ct_eq` for the Finished comparison, which is the one
+# comparison in the handshake an attacker gets to iterate against.
+crypto-nv = "^0.1"
+
+# X.509 and PKCS#8: `AsnCertificate`, the SAN extension, basic
+# constraints, key usage, the extended key usage OIDs, `is_valid_at`
+# against a civil date, and `ecdsa_signature_rs` for the fixed-width
+# form TLS 1.3 signatures are not in.  `tlscert` is a policy over this
+# package's parser and parses no DER of its own.
+asn1-nv = "^0.0.1"
+
+# X25519, which is the key exchange every TLS 1.3 deployment actually
+# uses and the only group this package's default offer names first.
+x25519-nv = "^0.0.1"
+
+# secp256r1 key exchange, for the deployments that require a NIST curve.
+# `p256-nv` carries ECDH and NOT ECDSA, which is why certificate
+# signature verification is a trait the caller supplies — the README's
+# "What is missing" section names the row.
+p256-nv = "^0.0.2"
+
+# Civil dates, for the certificate validity window.  A `core` module
+# has no clock, so `tlscert.valid_at` takes the instant as an argument
+# and `tlsconn.now_civil` is the one function in the package that reads
+# one.
+calendar-nv = "^0.0.2"
+
+# PEM, which is base64 with a header and a footer: `tlsconn.roots_from_pem`
+# is how a caller's trust store gets from a file into a `TlsRootStore`.
+base64-nv = "^0.0.1"
+
+# ChaCha20-Poly1305, the one AEAD on the grid, for
+# `TLS_CHACHA20_POLY1305_SHA256`.
+#
+# BY PATH, AND IT HAS TO BE CONVERTED BEFORE THE FIRST PUBLISH:
+# chacha20-nv is staged in `orbit/` and is not on the registry yet, so
+# there is no range to write.  When it publishes, this becomes
+# `chacha20-nv = "^0.0.1"` — the range out of its own manifest — and
+# `novo pkg publish` refuses the path form until then, which is the
+# check working rather than a problem to route around.
+chacha20-nv = "^0.0.1"

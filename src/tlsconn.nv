@@ -1,0 +1,240 @@
+// tlsconn.nv — the half that touches the machine: a socket, a clock,
+// and one function that reads the platform's trust store off disk.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS THE ONLY MODULE IN THE PACKAGE WITH AN EFFECT ROW.  Six
+// modules under `src/` are `[]` throughout; everything that performs
+// anything is here, and it is about two hundred lines of pumping.  That
+// ratio is the argument for the `tls-core-nv` row the README makes.
+//
+// THREE ROWS, AND EACH ONE IS ONE THING.  `[net]` is `std.net`'s, for
+// the socket.  `[time]` is `now_civil`'s, and `now_civil` exists
+// because a certificate's validity window is checked against an instant
+// and `tlscert` has no clock — one function in the package reads one,
+// and it is named after what it does.  `[fs]` is `system_roots`'s
+// alone, for the platform's certificate bundle: a file on Linux, and a
+// different file on every distribution.  A caller that supplies its own
+// roots never touches that function and never pays for it.
+//
+// THE CONNECTION API IS THE SHAPE `std.tls` ALREADY HAS, ON PURPOSE.
+// `dial`, `send`, `recv`, `close` — because postgres-nv, smtp-nv,
+// mqtt-nv and websocket-nv all declared a TLS hook this week against
+// `std.tls`'s `connect`/`send`/`recv`/`close`, and a replacement with a
+// different shape would be one every client has to be rewritten around.
+// What is different is what the functions ANSWER: `Result` with a named
+// fault rather than `?Int` plus a thread-local last-error string, which
+// is what `std.tls.last_error()` is and what makes a concurrent caller
+// read somebody else's failure.
+//
+// AND THE TRANSPORT IS A TRAIT, SO A CALLER'S OWN SOCKET IS A
+// FIRST-CLASS CASE.  `handshake_over` takes anything that implements
+// `TlsBytePipe[e]` and costs what that costs: `[io, net]` over a TCP
+// stream, nothing at all over a recorded transcript in a test, and
+// whatever a device's radio costs over a device's radio.  That is how
+// this package serves a consumer whose bytes do not come from
+// `std.net` at all.
+
+use tlscert
+
+// A byte pipe a TLS connection can be driven over.
+//
+// `e` is the row the implementation supplies and it is what
+// `handshake_over` costs.
+pub trait TlsBytePipe[e]
+    // Hand the pipe bytes; the answer is how many it took.
+    fn tls_pipe_send(self, data: Bytes) -> Result<Int, IoError> [e]
+    // Up to `max` bytes.  An EMPTY answer means the peer closed, which
+    // during a handshake is a truncation and not an end.
+    fn tls_pipe_recv(self, max: Int) -> Result<Bytes, IoError> [e]
+    // Close the underlying pipe.  Does not send close_notify — that is
+    // a TLS record and `tlsconn.close` sends it first.
+    fn tls_pipe_close(self) -> ?IoError [e]
+
+// A TCP socket as a byte pipe.
+pub struct TlsTcpPipe
+    stream: TcpStream
+
+// An established TLS connection: a session and the pipe under it.
+pub struct TlsConn
+    session: TlsSession
+    pipe: TlsTcpPipe
+
+// What can go wrong on a connection, as distinct from what the
+// handshake refused.
+pub enum TlsConnFault
+    // The TCP connection could not be opened.
+    TlsConnDialFailed(host: Str, port: Int)
+    // The socket failed mid-connection.
+    TlsConnPipeFailed(detail: Str)
+    // The peer closed the pipe during the handshake.  A truncation and
+    // not an end: nothing about the connection was agreed, so there is
+    // nothing to half-close.
+    TlsConnTruncatedHandshake(at: TlsHsState)
+    // The handshake itself refused something.
+    TlsConnHandshakeFault(fault: TlsHsFault)
+    // The chain was refused.
+    TlsConnCertificateFault(fault: TlsVerifyFault)
+    // The peer closed cleanly with close_notify; reading past it is
+    // this rather than an empty read, so a caller can tell a finished
+    // response from a truncated one.
+    TlsConnClosed
+    // The platform's trust store could not be read, naming the path
+    // that was tried.
+    TlsConnNoSystemRoots(tried: Str)
+    // A PEM block that is not base64, or has no certificate in it.
+    TlsConnBadPem(at_line: Int)
+    // The handshake wanted a signature or a key exchange and this
+    // module has no primitive for it.  See the README: ECDSA and RSA
+    // signature verification are not on the grid, so a caller supplies
+    // a `TlsSigCheck` and `dial` refuses without one.
+    TlsConnNoSigChecker(scheme: TlsSigScheme)
+
+// Open a TLS connection over a fresh TCP socket.
+//
+// `[net]` for the socket, `[time]` for the certificate validity window.
+// The checker is an argument for the reason the README's "What is
+// missing" section gives: no signature verification for ECDSA or RSA
+// exists on this grid, so there is nothing sensible to default to and a
+// default that accepted every chain would be the worst possible one.
+pub fn dial(host: Str, port: Int, cfg: TlsClientConfig,
+            checker: TlsFnSigCheck) -> Result<TlsConn, TlsConnFault> [net, time]
+    todo("tls-nv.tlsconn.dial")
+
+// Complete a server handshake on a socket a listener already accepted.
+pub fn accept(stream: TcpStream, cfg: TlsServerConfig,
+              checker: TlsFnSigCheck) -> Result<TlsConn, TlsConnFault> [net, time]
+    todo("tls-nv.tlsconn.accept")
+
+// Pump a handshake to completion over a caller's own pipe.
+//
+// Effect-polymorphic over the PIPE, and the pipe only: costs `[io,
+// net]` over a TCP stream and nothing at all over a recorded
+// transcript.  The checker is `tlscert.TlsFnSigCheck`, which costs
+// nothing, because SPEC § 5.6 gives a function ONE effect parameter and
+// this one has spent it on the pipe.  A caller whose verification costs
+// something drives `tlshs` and `tlscert.verify_chain` directly, where
+// the parameter is free — the README's "Where a row wanted to widen"
+// section is about exactly this.
+//
+// The instant is an argument rather than read here, so a test drives a
+// whole handshake against a recorded transcript with no clock and no
+// socket and gets the same answer every run.
+pub fn handshake_over<P: TlsBytePipe[e]>(pipe: P, s: TlsSession, at: CivilDateTime,
+                                         checker: TlsFnSigCheck) -> Result<TlsSession, TlsConnFault> [e]
+    todo("tls-nv.tlsconn.handshake_over")
+
+// Send application data.
+pub fn send(c: TlsConn, data: Bytes) -> Result<Int, TlsConnFault> [net]
+    todo("tls-nv.tlsconn.send")
+
+// Read up to `max` bytes of application data.
+//
+// `TlsConnClosed` on a clean close rather than an empty answer, because
+// an empty answer is what a truncation attack looks like and the
+// difference is the whole reason close_notify exists.
+pub fn recv(c: TlsConn, max: Int) -> Result<Bytes, TlsConnFault> [net]
+    todo("tls-nv.tlsconn.recv")
+
+// Send close_notify and close the socket.
+pub fn close(c: TlsConn) -> ?TlsConnFault [net]
+    todo("tls-nv.tlsconn.close")
+
+// The wall clock as a civil date and time, UTC.
+//
+// The ONE function in this package that reads a clock, and the reason
+// `[time]` appears in the manifest at all.  `tlscert.valid_at` takes
+// the instant it answers.
+pub fn now_civil() -> CivilDateTime [time]
+    todo("tls-nv.tlsconn.now_civil")
+
+// The platform's certificate bundle, read off disk.
+//
+// The ONE function in this package that touches a filesystem.  A caller
+// that compiles its roots in, or pins a key, never calls it and the
+// `[fs]` row never reaches their program.
+//
+// It answers `TlsConnNoSystemRoots` naming the paths it tried rather
+// than an empty store, because an empty store trusts nothing and an
+// empty store a caller believed was the system's trusts nothing
+// silently.
+pub fn system_roots() -> Result<TlsRootStore, TlsConnFault> [fs]
+    todo("tls-nv.tlsconn.system_roots")
+
+// A root store from PEM text a caller already holds.
+//
+// `[]`: the decoding is base64-nv's and the parsing is asn1-nv's, and
+// neither of them reads anything.
+pub fn roots_from_pem(pem: Str) -> Result<TlsRootStore, TlsConnFault> []
+    todo("tls-nv.tlsconn.roots_from_pem")
+
+// The DER certificates in a PEM document, in order.
+pub fn certificates_from_pem(pem: Str) -> Result<[Bytes], TlsConnFault> []
+    todo("tls-nv.tlsconn.certificates_from_pem")
+
+// Render DER certificates as PEM.
+pub fn certificates_to_pem(ders: [Bytes]) -> Str []
+    todo("tls-nv.tlsconn.certificates_to_pem")
+
+// The protocol ALPN agreed on.
+pub fn alpn_of(c: TlsConn) -> ?Str []
+    todo("tls-nv.tlsconn.alpn_of")
+
+// The cipher suite in use.
+pub fn suite_of(c: TlsConn) -> ?TlsCipherSuite []
+    todo("tls-nv.tlsconn.suite_of")
+
+// The peer's certificate chain, leaf first.
+pub fn peer_chain_of(c: TlsConn) -> [Bytes] []
+    todo("tls-nv.tlsconn.peer_chain_of")
+
+// The session inside, for a caller that wants to drive it directly.
+pub fn session_of(c: TlsConn) -> TlsSession []
+    todo("tls-nv.tlsconn.session_of")
+
+// The socket inside, for a caller that has to set an option this
+// package does not wrap.
+pub fn stream_of(c: TlsConn) -> TcpStream []
+    todo("tls-nv.tlsconn.stream_of")
+
+// Wrap a TCP stream as a byte pipe.
+pub fn pipe_of(stream: TcpStream) -> TlsTcpPipe []
+    todo("tls-nv.tlsconn.pipe_of")
+
+// A TCP socket as a byte pipe.
+//
+// `[io, net]`, which is `std.net`'s own row: the send and receive are
+// the socket's, and nothing here adds to them.
+//
+// ```novo ignore
+// use tlsconn
+//
+// fn write(p: TlsTcpPipe, b: Bytes) -> Result<Int, IoError> [io, net]
+//     p.tls_pipe_send(b)
+// ```
+impl TlsBytePipe[io, net] for TlsTcpPipe
+    fn tls_pipe_send(self, data: Bytes) -> Result<Int, IoError> [io, net]
+        todo("tls-nv.tlsconn.TlsTcpPipe.tls_pipe_send")
+
+    fn tls_pipe_recv(self, max: Int) -> Result<Bytes, IoError> [io, net]
+        todo("tls-nv.tlsconn.TlsTcpPipe.tls_pipe_recv")
+
+    fn tls_pipe_close(self) -> ?IoError [io, net]
+        todo("tls-nv.tlsconn.TlsTcpPipe.tls_pipe_close")
+
+// What went wrong on a connection, in one line.
+//
+// A named value and not a thread-local string.  `std.tls` answers
+// `?Int` and puts the detail in `last_error()`, which two connections
+// failing in two tasks overwrite for each other; a caller of this
+// module holds its own failure.
+//
+// ```novo ignore
+// use tlsconn
+//
+// fn report(e: TlsConnFault) -> Str
+//     e.message()
+// ```
+impl Error for TlsConnFault
+    fn message(self) -> Str
+        todo("tls-nv.tlsconn.TlsConnFault.message")

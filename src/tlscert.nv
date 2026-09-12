@@ -1,0 +1,369 @@
+// tlscert.nv — what a certificate chain has to prove before a
+// connection is worth having, and the one thing this package cannot do
+// itself.
+//
+// Every body here is a `todo()`; the signatures are the design.  Every
+// row is `[]` except `verify_chain` and `verify_handshake_signature`,
+// which are effect-POLYMORPHIC over the caller's signature checker and
+// cost whatever it costs.
+//
+// THIS MODULE PARSES NO DER.  asn1-nv's `parse_certificate`,
+// `subject_alt_dns_names`, `basic_constraints`, `key_usage`,
+// `ext_key_usage_oids` and `is_valid_at` are the parser; what is here
+// is the POLICY over them — which is the half that has the interesting
+// mistakes in it.
+//
+// THE SIGNATURE CHECK IS A TRAIT THE CALLER SUPPLIES, AND THAT IS NOT A
+// DESIGN PREFERENCE.  There is no ECDSA and no RSA on this grid:
+// p256-nv carries ECDH and no signing or verification at all, and
+// nothing carries RSA.  So `TlsSigCheck` is what a caller plugs a
+// verifier into, and this package cannot pretend to validate a chain
+// without one.  The README's "What is missing" section names the rows.
+// The shape earns its keep beyond that: a device that verifies in a
+// secure element spends `[hw]` doing it, a program with a pure verifier
+// spends nothing, and `verify_chain` is charged whichever it is given.
+//
+// THE NAME IS MATCHED AGAINST THE SUBJECT ALTERNATIVE NAME, AND NEVER
+// AGAINST THE COMMON NAME.  CN fallback was deprecated in 2000, removed
+// from the browsers by 2017, and is still the single most common way a
+// hand-written TLS client accepts a certificate issued for something
+// else.  `name_matches` reads dNSName entries and there is no CN
+// accessor in this module at all.
+//
+// A WILDCARD MATCHES ONE LABEL, THE LEFTMOST, AND NOT A DOT.
+// `*.example.com` matches `a.example.com` and does NOT match
+// `example.com` or `a.b.example.com`.  A glob that treated `*` as "any
+// characters" accepts `evil.com/x.example.com` from a certificate
+// authority that will issue `*.com` to nobody but would issue
+// `*.co.uk`.  `wildcard_matches` is separate and public so it can be
+// asserted on its own.
+//
+// THE CHAIN IS NOT AN ORDER, IT IS A GRAPH TO SEARCH.  RFC 8446 § 4.4.2
+// dropped the requirement that a server's Certificate list be a valid
+// ordered chain, and real servers send cross-signed intermediates out
+// of order and send anchors they should not.  `verify_chain` BUILDS a
+// path from the leaf to something in the root store; it does not walk
+// the list.  A validator that walked it fails against a large share of
+// the public web and succeeds against every test the author wrote.
+//
+// AND THE TRUST ANCHOR COMES FROM THE CALLER.  `TlsRootStore` is a
+// value a caller constructs — from a file, from a compiled-in list, or
+// from nothing at all for a pinned connection.  There is no ambient
+// system store in this module, because a `core`-shaped module that read
+// one would not be `[]` and because "the system store" is a different
+// set of certificates on every platform this runs on.  `tlsconn`
+// carries the one function that reads the platform's, and its row says
+// `[fs]`.
+
+use tlsmsg
+
+// The certificates a chain is allowed to end at.
+//
+// Constructed by the caller, from DER.  An EMPTY store is legal and
+// means every chain fails `TlsCertNoTrustAnchor` — which is the right
+// answer for a connection that is pinned by public key instead, and a
+// better one than a store that silently trusted whatever the platform
+// last installed.
+pub struct TlsRootStore
+    anchors: [Bytes]
+
+// The ceilings chain building is held to.
+pub struct TlsCertLimits
+    max_chain_len: Int
+    max_certificate_bytes: Int
+    max_names: Int
+    // Whether a certificate carrying a critical extension this package
+    // does not understand is refused.  True, and RFC 5280 § 4.2 says
+    // it must be: a critical extension is the issuer saying "refuse
+    // this if you do not understand me", and honouring it is the whole
+    // of what critical means.
+    refuse_unknown_critical: Bool
+
+// What a verified chain told the caller, so nothing has to parse the
+// leaf a second time.
+pub struct TlsVerified
+    // The leaf's SubjectPublicKeyInfo, DER, which is what the
+    // CertificateVerify signature is checked against.
+    leaf_spki: Bytes
+    // The name that actually matched — the wildcard pattern when one
+    // did, so a log says `*.example.com` rather than the host that was
+    // asked for.
+    matched_name: Str
+    // How many certificates the built path used, leaf and anchor
+    // included.
+    path_len: Int
+
+// Why a chain was refused.
+//
+// Every variant names something a caller or an operator can act on.
+// There is deliberately no "certificate invalid" catch-all: an
+// unspecific refusal is what makes people turn verification off.
+pub enum TlsVerifyFault
+    // The instant checked against was outside notBefore/notAfter, with
+    // the certificate's own window so a report can say by how much.
+    TlsCertExpired(not_after: Str)
+    TlsCertNotYetValid(not_before: Str)
+    // No dNSName in the leaf matched, carrying what was asked for.
+    TlsCertNameMismatch(wanted: Str)
+    TlsCertChainTooLong(length: Int, limit: Int)
+    // No path from the leaf reached anything in the root store.
+    TlsCertNoTrustAnchor
+    // A link's signature did not verify, with its position in the built
+    // path.
+    TlsCertBadSignature(index: Int)
+    // An intermediate without `basicConstraints.cA`, which is the
+    // failure that lets any leaf certificate sign for any name.
+    TlsCertNotACa(index: Int)
+    // A path longer than an intermediate's `pathLenConstraint` allows.
+    TlsCertPathLenExceeded(index: Int, allowed: Int)
+    // A critical extension this package does not understand, named by
+    // its OID.
+    TlsCertUnknownCriticalExtension(oid: Str)
+    // A leaf whose key usage or extended key usage forbids server
+    // authentication.
+    TlsCertUsageForbidden(index: Int)
+    // asn1-nv refused the DER, at an offset.
+    TlsCertMalformed(index: Int, offset: Int)
+    // A signature algorithm the caller's checker does not implement.
+    TlsCertSchemeUnsupported(scheme: TlsSigScheme)
+    // The certificate's outer signatureAlgorithm and its inner
+    // tbsCertificate.signature disagree — asn1-nv's `algorithms_agree`
+    // is false.  An implementation that checked only the outer one can
+    // be given a certificate whose signed content claims a different
+    // algorithm from the one being verified.
+    TlsCertAlgorithmMismatch(index: Int)
+
+// A checker for one signature, supplied by the caller.
+//
+// `e` is the row the implementation costs, and it is what
+// `verify_chain` is charged: nothing for a pure verifier, `[hw]` for a
+// secure element, `[net]` for a remote signer.
+//
+// The message is the bytes that were signed — the tbsCertificate for a
+// chain link, `tlsmsg.verify_context`'s output for a CertificateVerify
+// — and the signature is in the scheme's own encoding: DER
+// SEQUENCE{r,s} for ECDSA in a certificate, and the FIXED-WIDTH r||s
+// concatenation for ECDSA in a CertificateVerify.  The two are
+// different encodings of the same value and asn1-nv's
+// `ecdsa_signature_rs` and `ecdsa_signature_der` convert between them;
+// a checker that assumed one form verifies certificates and rejects
+// handshakes, or the reverse.
+pub trait TlsSigCheck[e]
+    // Whether this signature is good.  A `Bool` and not a `Result`:
+    // an implementation that distinguished "bad signature" from "could
+    // not check" would have a caller deciding which of them is fatal,
+    // and both of them are.
+    fn tls_check(self, scheme: TlsSigScheme, spki: Bytes, message: Bytes, signature: Bytes) -> Bool [e]
+    // Whether the checker implements a scheme at all, asked before a
+    // path is built so a chain that cannot be checked fails with
+    // `TlsCertSchemeUnsupported` rather than with a bad signature.
+    fn tls_supports(self, scheme: TlsSigScheme) -> Bool
+
+// A pure checker built from two named functions.
+//
+// It exists because SPEC § 5.6 allows a function ONE effect parameter,
+// and `tlsconn.handshake_over` has already spent its on the byte pipe.
+// So the host pump takes this concrete, `[]`-costing checker, and a
+// caller whose verification costs something — a secure element, a
+// remote signer — drives `tlshs` and `verify_chain` itself, where the
+// effect parameter is free.  The README says so under the same
+// heading.
+//
+// Named functions and not lambdas: a lambda that becomes a value is
+// refused at `@tier(embedded)`, and this struct is the one shape in
+// the package a device consumer would otherwise trip over.
+pub struct TlsFnSigCheck
+    check: fn(TlsSigScheme, Bytes, Bytes, Bytes) -> Bool
+    supports: fn(TlsSigScheme) -> Bool
+
+// Build a pure checker from a verification function and the predicate
+// that says which schemes it implements.
+pub fn checker_of(check: fn(TlsSigScheme, Bytes, Bytes, Bytes) -> Bool,
+                  supports: fn(TlsSigScheme) -> Bool) -> TlsFnSigCheck []
+    todo("tls-nv.tlscert.checker_of")
+
+// A checker that implements nothing and verifies nothing.
+//
+// Not a permissive default — the opposite.  Every chain checked with it
+// fails `TlsCertSchemeUnsupported` naming the scheme, which is the
+// honest state of this grid today: no ECDSA and no RSA verification is
+// published.  A caller sees the missing primitive by name rather than a
+// connection that appeared to verify.
+pub fn no_checker() -> TlsFnSigCheck []
+    todo("tls-nv.tlscert.no_checker")
+
+// A root store from DER certificates.
+pub fn root_store(anchors: [Bytes]) -> TlsRootStore []
+    todo("tls-nv.tlscert.root_store")
+
+// A root store that trusts nothing, for a connection pinned by public
+// key.
+pub fn empty_root_store() -> TlsRootStore []
+    todo("tls-nv.tlscert.empty_root_store")
+
+// How many anchors a store holds.
+pub fn root_count(s: TlsRootStore) -> Int []
+    todo("tls-nv.tlscert.root_count")
+
+// Limits a public-web client is comfortable with.
+pub fn default_cert_limits() -> TlsCertLimits []
+    todo("tls-nv.tlscert.default_cert_limits")
+
+// Limits for a device: a chain of three, a 4 KiB certificate ceiling.
+pub fn embedded_cert_limits() -> TlsCertLimits []
+    todo("tls-nv.tlscert.embedded_cert_limits")
+
+// Whether any dNSName in the certificate matches the host.
+//
+// Subject alternative names only.  There is no common-name fallback in
+// this module and no accessor that would let a caller add one.
+pub fn name_matches(cert: Bytes, host: Str,
+                    limits: TlsCertLimits) -> Result<Bool, TlsVerifyFault> []
+    todo("tls-nv.tlscert.name_matches")
+
+// Whether a wildcard pattern matches a host: one leftmost label, and
+// the `*` does not cross a dot.
+//
+// `*.example.com` matches `a.example.com`, and matches neither
+// `example.com` nor `a.b.example.com`.
+pub fn wildcard_matches(pattern: Str, host: Str) -> Bool []
+    todo("tls-nv.tlscert.wildcard_matches")
+
+// Every dNSName the certificate carries, for a caller that wants to
+// report what it was issued for.
+pub fn dns_names_of(cert: Bytes, limits: TlsCertLimits) -> Result<[Str], TlsVerifyFault> []
+    todo("tls-nv.tlscert.dns_names_of")
+
+// Whether the instant is inside the certificate's validity window.
+//
+// The instant is an argument, because a `core`-shaped module has no
+// clock and because a validator whose "now" is a parameter is one a
+// test can drive over a decade in four lines.
+pub fn valid_at(cert: Bytes, at: CivilDateTime,
+                limits: TlsCertLimits) -> Result<Bool, TlsVerifyFault> []
+    todo("tls-nv.tlscert.valid_at")
+
+// Whether the certificate may sign other certificates.
+pub fn is_ca(cert: Bytes, limits: TlsCertLimits) -> Result<Bool, TlsVerifyFault> []
+    todo("tls-nv.tlscert.is_ca")
+
+// The `pathLenConstraint`, or `None` when there is none.
+pub fn path_len_of(cert: Bytes, limits: TlsCertLimits) -> Result<?Int, TlsVerifyFault> []
+    todo("tls-nv.tlscert.path_len_of")
+
+// Whether the certificate's key usage and extended key usage permit
+// server authentication.
+pub fn allows_server_auth(cert: Bytes, limits: TlsCertLimits) -> Result<Bool, TlsVerifyFault> []
+    todo("tls-nv.tlscert.allows_server_auth")
+
+// Whether the certificate's key usage and extended key usage permit
+// client authentication.
+pub fn allows_client_auth(cert: Bytes, limits: TlsCertLimits) -> Result<Bool, TlsVerifyFault> []
+    todo("tls-nv.tlscert.allows_client_auth")
+
+// The exact bytes a certificate's signature is over: its
+// tbsCertificate, as encoded.
+//
+// As encoded, byte for byte — not re-encoded from a parse.  A
+// validator that re-encoded would verify a different value from the one
+// the issuer signed whenever the issuer's encoder made a choice this
+// one makes differently, and would then reject certificates that are
+// perfectly good.
+pub fn signed_data(cert: Bytes, limits: TlsCertLimits) -> Result<Bytes, TlsVerifyFault> []
+    todo("tls-nv.tlscert.signed_data")
+
+// The signature scheme the certificate was signed with.
+pub fn signature_scheme_of(cert: Bytes,
+                           limits: TlsCertLimits) -> Result<TlsSigScheme, TlsVerifyFault> []
+    todo("tls-nv.tlscert.signature_scheme_of")
+
+// The certificate's signature value.
+pub fn signature_of(cert: Bytes, limits: TlsCertLimits) -> Result<Bytes, TlsVerifyFault> []
+    todo("tls-nv.tlscert.signature_of")
+
+// The certificate's SubjectPublicKeyInfo, DER.
+pub fn spki_of(cert: Bytes, limits: TlsCertLimits) -> Result<Bytes, TlsVerifyFault> []
+    todo("tls-nv.tlscert.spki_of")
+
+// Whether one certificate's issuer name equals another's subject name,
+// compared over the ENCODED names rather than over rendered text.
+//
+// asn1-nv's `names_encode_equal`.  Comparing `name_text` output instead
+// makes two distinct issuers with the same printable name look like one.
+pub fn issued_by(child: Bytes, parent: Bytes,
+                 limits: TlsCertLimits) -> Result<Bool, TlsVerifyFault> []
+    todo("tls-nv.tlscert.issued_by")
+
+// Build a path from the leaf to an anchor and check every link.
+//
+// Effect-polymorphic: costs whatever the caller's checker costs, which
+// is nothing for a pure verifier.
+//
+// It BUILDS the path rather than walking the list.  The list is a bag
+// of certificates that may be out of order, may contain an anchor, and
+// may contain certificates that belong to no path at all — which is
+// what real servers send.
+pub fn verify_chain<V: TlsSigCheck[e]>(chain: [Bytes], host: Str, at: CivilDateTime,
+                                       roots: TlsRootStore, checker: V,
+                                       limits: TlsCertLimits) -> Result<TlsVerified, TlsVerifyFault> [e]
+    todo("tls-nv.tlscert.verify_chain")
+
+// Check a CertificateVerify signature against the leaf's public key.
+//
+// The signed content is `tlsmsg.verify_context(role, transcript_hash)`
+// — 64 spaces, the role's label, a zero byte, the hash — and the role
+// is the SIGNER's, not the verifier's.  Passing the verifier's role is
+// the mistake this signature exists to make impossible, so it is the
+// argument rather than something derived.
+pub fn verify_handshake_signature<V: TlsSigCheck[e]>(checker: V, leaf_spki: Bytes, signer: TlsRole,
+                                                     scheme: TlsSigScheme, transcript_hash: Bytes,
+                                                     signature: Bytes) -> Result<Unit, TlsVerifyFault> [e]
+    todo("tls-nv.tlscert.verify_handshake_signature")
+
+// Whether a chain could be checked at all with this checker, asked
+// before any signature is verified.
+//
+// So that a chain signed with an algorithm the caller cannot check
+// fails as `TlsCertSchemeUnsupported` naming the scheme, rather than as
+// a bad signature that sends someone looking for a corrupted
+// certificate.
+pub fn schemes_supported<V: TlsSigCheck[e]>(chain: [Bytes], checker: V,
+                                            limits: TlsCertLimits) -> Result<Bool, TlsVerifyFault> [e]
+    todo("tls-nv.tlscert.schemes_supported")
+
+// Why a chain was refused, in one line.
+//
+// Every line names something actionable: the name that was wanted, the
+// position in the path, the OID of the extension nobody understood.
+// "certificate invalid" is what makes an operator disable verification,
+// so it is not a sentence this package can produce.
+//
+// ```novo ignore
+// use tlscert
+//
+// fn report(e: TlsVerifyFault) -> Str
+//     e.message()
+// ```
+impl Error for TlsVerifyFault
+    fn message(self) -> Str
+        todo("tls-nv.tlscert.TlsVerifyFault.message")
+
+// A checker made of two named functions, costing nothing.
+//
+// The empty row is the point: this is the implementation
+// `tlsconn.handshake_over` can take beside an effect-parameterised byte
+// pipe, because the one effect parameter a function is allowed is
+// already the pipe's.
+//
+// ```novo ignore
+// use tlscert
+//
+// fn ok(c: TlsFnSigCheck, spki: Bytes, msg: Bytes, sig: Bytes) -> Bool
+//     c.tls_check(TlsEcdsaP256Sha256, spki, msg, sig)
+// ```
+impl TlsSigCheck[] for TlsFnSigCheck
+    fn tls_check(self, scheme: TlsSigScheme, spki: Bytes, message: Bytes, signature: Bytes) -> Bool
+        todo("tls-nv.tlscert.TlsFnSigCheck.tls_check")
+
+    fn tls_supports(self, scheme: TlsSigScheme) -> Bool
+        todo("tls-nv.tlscert.TlsFnSigCheck.tls_supports")

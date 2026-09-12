@@ -1,0 +1,436 @@
+// tlshs.nv — the handshake, as a value that performs nothing.
+//
+// Every body here is a `todo()`; the signatures are the design.
+// Every row is `[]`.
+//
+// THIS IS THE MODULE THE PACKAGE IS ABOUT.  A `TlsSession` is a client
+// or a server handshake in progress.  It is fed bytes and it answers a
+// `TlsAction` — put these bytes on the wire, I need more, here is
+// plaintext, check this chain, sign this, we are done.  It never
+// touches a socket, never reads a clock and never generates a random
+// number; the randomness, the ephemeral key exchange, the certificate
+// verdict and the signature all arrive as arguments.
+//
+// WHAT THAT BUYS, CONCRETELY.  A whole handshake against RFC 8448's
+// recorded traces is a test with no network in it and no timing in it,
+// and it produces the same bytes every run.  A device that speaks TLS
+// over a radio this package has never heard of pumps the same value.  A
+// server and a client share one state machine rather than two that
+// drift.  And the effect rows say so: every function here is `[]`, and
+// the only module in the package that is not is `tlsconn`.
+//
+// THE ACTION IS THE INTERFACE, AND ITS SHAPE IS A CLAIM.  Six of the
+// eight variants say "the host does something and comes back"; the two
+// that do not — `TlsHandshakeDone` and `TlsPeerClosed` — end the
+// conversation.  There is no variant that means "I did something", and
+// that absence is the sans-IO property written into a type: if the
+// enum could say "I sent it", something in here would have.
+//
+// THE ORDER OF KEY INSTALLATION IS WHERE THE BUGS LIVE.  After the
+// ServerHello both sides switch to handshake keys, and every record
+// from that point is encrypted — including the server's Certificate,
+// its CertificateVerify and its Finished.  After the SERVER's Finished
+// the application keys are derived and the server may send application
+// data immediately, BEFORE the client's Finished arrives.  A client
+// that waited for its own Finished to install read keys drops the first
+// response of every connection to a fast server.
+//
+// A CHANGE_CIPHER_SPEC RECORD IS DISCARDED, EXACTLY TWICE.  TLS 1.3 has
+// no cipher change to signal; the record exists so that middleboxes
+// which learned TLS 1.2 see something familiar.  A receiver discards it
+// before the handshake completes and treats it as an error afterwards —
+// an implementation that discarded it unconditionally has given a peer
+// a free way to inject records into an established session that the
+// state machine will quietly drop.
+//
+// ONE THING IS REFUSED BY CONSTRUCTION: 0-RTT.  There is no early-data
+// variant on `TlsAction`, no `max_early_data` on the client
+// configuration, and `TlsTicket.max_early_data` is read only so a
+// caller can see what a server offered.  Early data is not replay
+// protected, and a library that made it one option among several has
+// made a replayable request the default for whoever did not read this
+// paragraph.  The README says what it would take to add it.
+
+use tlscert
+
+// What a client offers and what it will accept.
+pub struct TlsClientConfig
+    // The name in SNI, and the name the certificate has to match.  One
+    // field for both, because a client that sent one name and checked
+    // another is a client that can be pointed anywhere.
+    server_name: Str
+    roots: TlsRootStore
+    suites: [TlsCipherSuite]
+    groups: [TlsNamedGroup]
+    schemes: [TlsSigScheme]
+    // Offered in preference order; empty offers no ALPN extension at
+    // all, which is different from offering an empty list.
+    alpn: [Str]
+    msg_limits: TlsMsgLimits
+    cert_limits: TlsCertLimits
+    // Whether a NewSessionTicket is kept for a later connection.
+    keep_tickets: Bool
+
+// What a server presents and what it will accept.
+pub struct TlsServerConfig
+    // DER, leaf first.
+    chain: [Bytes]
+    suites: [TlsCipherSuite]
+    groups: [TlsNamedGroup]
+    // The schemes this server can actually sign with, which is a
+    // narrower set than a client's advertised list and is decided by
+    // the key behind `TlsAction`'s signing request.
+    schemes: [TlsSigScheme]
+    // Protocols this server supports, in ITS order of preference — and
+    // the server's order is the one that wins.
+    alpn: [Str]
+    // Whether a CertificateRequest is sent.
+    request_client_auth: Bool
+    client_roots: TlsRootStore
+    msg_limits: TlsMsgLimits
+    cert_limits: TlsCertLimits
+
+// Where a handshake stands.
+pub enum TlsHsState
+    TlsStart
+    TlsWaitServerHello
+    // A HelloRetryRequest arrived; the transcript has been rewritten
+    // and a second ClientHello is going out.
+    TlsWaitSecondServerHello
+    TlsWaitEncryptedExtensions
+    TlsWaitCertificate
+    TlsWaitCertificateVerify
+    TlsWaitFinished
+    // The server's side is finished and the client is sending its own
+    // Finished.  Application data from the server is already readable
+    // here.
+    TlsWaitClientFinished
+    TlsConnected
+    TlsClosedState
+    TlsFailedState
+
+// An alert, by the descriptions this package can send or receive.
+pub enum TlsAlert
+    // The only one that is not a failure: the peer is done writing.
+    TlsCloseNotify
+    TlsUnexpectedMessage
+    // An AEAD tag did not verify.  Nothing more specific is ever sent,
+    // because a more specific alert is a measurement.
+    TlsBadRecordMac
+    TlsHandshakeFailure
+    TlsBadCertificate
+    TlsCertificateExpired
+    TlsCertificateUnknown
+    TlsIllegalParameter
+    TlsUnknownCa
+    TlsDecodeError
+    TlsDecryptError
+    TlsProtocolVersion
+    TlsInsufficientSecurity
+    TlsInternalError
+    TlsMissingExtension
+    TlsUnsupportedExtension
+    TlsUnrecognizedName
+    TlsNoApplicationProtocol
+    TlsUnknownAlert(code: Int)
+
+// What the host must do next.
+//
+// THE LOAD-BEARING INTERFACE OF THIS PACKAGE.  Every variant is an
+// instruction to the caller; none of them reports something this
+// package did, because this package does nothing.
+pub enum TlsAction
+    // Read at least this many more bytes from the peer and `feed` them.
+    // The number is a floor and not a promise: more is fine.
+    TlsWantMoreBytes(least: Int)
+    // This many bytes are waiting in the session's outgoing buffer.
+    // `take_outgoing` drains them; the connection is not correct until
+    // they are on the wire.
+    TlsSendBytes(length: Int)
+    // This many bytes of application plaintext are waiting.
+    // `take_plaintext` drains them.
+    TlsDeliverPlaintext(length: Int)
+    // A certificate chain arrived.  `pending_chain` is the chain,
+    // `tlscert.verify_chain` is what to run over it, and
+    // `supply_certificate_verdict` is how the answer comes back.  It is
+    // the host's step because the clock and the signature checker are
+    // the host's.
+    TlsCheckCertificate(count: Int)
+    // A CertificateVerify has to be produced.  `pending_signature_input`
+    // is the content, and `supply_signature` is the answer.  A server
+    // only; the private key is never in this package.
+    TlsSignTranscript(scheme: TlsSigScheme)
+    // A key exchange has to be performed.  `pending_key_exchange` names
+    // the group and the peer's public key; `supply_shared_secret` is
+    // the answer.
+    TlsPerformKeyExchange(group: TlsNamedGroup)
+    // The handshake is complete.  `alpn_of` and `suite_of` answer what
+    // was agreed.
+    TlsHandshakeDone
+    // The peer sent close_notify.  Nothing more will be read; whatever
+    // is in the outgoing buffer should still go out.
+    TlsPeerClosed
+
+// A session, and what the host should do about it.
+//
+// Two fields, because every function in this module answers both: the
+// session is a value, so the caller holds the new one and the old one
+// is simply not used again.
+pub struct TlsStep
+    session: TlsSession
+    action: TlsAction
+
+// A handshake in progress — client or server.
+//
+// Opaque.  The fields are here because a struct needs them, and every
+// question a caller has an answer to is a function on this page.
+pub struct TlsSession
+    role: TlsRole
+    state: TlsHsState
+    suite: TlsCipherSuite
+    secrets: TlsSecrets
+    transcript: TlsTranscript
+    read_keys: TlsTrafficKeys
+    write_keys: TlsTrafficKeys
+    incoming: Bytes
+    outgoing: Bytes
+    plaintext: Bytes
+    chain: [Bytes]
+    alpn: Str
+    encrypted: Bool
+
+// What the state machine refuses, as distinct from what it reports to
+// the peer as an alert.
+pub enum TlsHsFault
+    // A message arrived in a state that does not accept it.  Both are
+    // named, because "unexpected message" without them is the hardest
+    // TLS failure to diagnose.
+    TlsHsUnexpectedMessage(saw: TlsMsgKind, at: TlsHsState)
+    // A record arrived that the record layer refused.
+    TlsHsRecordFault(fault: TlsRecordFault)
+    // A handshake message the codec refused.
+    TlsHsMsgFault(fault: TlsMsgFault)
+    // A key derivation the schedule refused.
+    TlsHsKeyFault(fault: TlsKeyFault)
+    // An AEAD operation that failed — including a tag mismatch, which
+    // is fatal and closes the connection.
+    TlsHsAeadFault(fault: TlsAeadFault)
+    // The peer's certificate chain was refused, with the reason the
+    // host's verdict carried.
+    TlsHsCertFault(fault: TlsVerifyFault)
+    // The peer sent an alert.
+    TlsHsPeerAlert(alert: TlsAlert)
+    // The peer chose a suite, a group or a version that was not
+    // offered.  A server that does this is either broken or is a
+    // middlebox trying a downgrade, and both are fatal.
+    TlsHsNotOffered(what: Str)
+    // The peer's Finished did not match.  There is no detail: the
+    // comparison is constant time and so is the report.
+    TlsHsFinishedMismatch
+    // An answer supplied for a question the session did not ask.
+    TlsHsNothingPending(wanted: Str)
+    // A ChangeCipherSpec record after the handshake completed, which is
+    // a peer injecting records a lenient implementation would discard.
+    TlsHsChangeCipherSpecTooLate
+
+// A client configuration for a host, verified against a root store.
+pub fn client_config(server_name: Str, roots: TlsRootStore) -> TlsClientConfig []
+    todo("tls-nv.tlshs.client_config")
+
+// Offer these ALPN protocols, in this order.
+pub fn with_alpn(c: TlsClientConfig, protocols: [Str]) -> TlsClientConfig []
+    todo("tls-nv.tlshs.with_alpn")
+
+// Offer these cipher suites instead of the default.
+pub fn with_suites(c: TlsClientConfig, suites: [TlsCipherSuite]) -> TlsClientConfig []
+    todo("tls-nv.tlshs.with_suites")
+
+// Offer these key-exchange groups instead of the default.
+pub fn with_groups(c: TlsClientConfig, groups: [TlsNamedGroup]) -> TlsClientConfig []
+    todo("tls-nv.tlshs.with_groups")
+
+// Advertise these signature schemes instead of the default.
+pub fn with_schemes(c: TlsClientConfig, schemes: [TlsSigScheme]) -> TlsClientConfig []
+    todo("tls-nv.tlshs.with_schemes")
+
+// Use these message and certificate limits — an embedded caller's, for
+// instance.
+pub fn with_limits(c: TlsClientConfig, msg: TlsMsgLimits, cert: TlsCertLimits) -> TlsClientConfig []
+    todo("tls-nv.tlshs.with_limits")
+
+// A server configuration presenting this chain, leaf first.
+pub fn server_config(chain: [Bytes]) -> TlsServerConfig []
+    todo("tls-nv.tlshs.server_config")
+
+// Support these ALPN protocols, in the SERVER's order of preference —
+// which is the order that decides, RFC 7301 § 3.2.
+pub fn with_server_alpn(s: TlsServerConfig, protocols: [Str]) -> TlsServerConfig []
+    todo("tls-nv.tlshs.with_server_alpn")
+
+// Ask the client for a certificate, verified against these roots.
+pub fn with_client_auth(s: TlsServerConfig, roots: TlsRootStore) -> TlsServerConfig []
+    todo("tls-nv.tlshs.with_client_auth")
+
+// Sign with these schemes; the first one a client advertised is chosen.
+pub fn with_server_schemes(s: TlsServerConfig, schemes: [TlsSigScheme]) -> TlsServerConfig []
+    todo("tls-nv.tlshs.with_server_schemes")
+
+// A client session.
+//
+// The 32 random bytes and the ephemeral public keys are ARGUMENTS.
+// That is what keeps this module `[]`, and it is also what makes a
+// handshake reproducible: a test supplies RFC 8448's recorded values
+// and asserts the bytes on the wire, which is not a thing an
+// implementation that generated its own randomness can do.
+pub fn client(cfg: TlsClientConfig, random: Bytes, key_shares: [TlsKeyShareEntry]) -> TlsSession []
+    todo("tls-nv.tlshs.client")
+
+// A server session, with the same argument discipline.
+pub fn server(cfg: TlsServerConfig, random: Bytes, key_shares: [TlsKeyShareEntry]) -> TlsSession []
+    todo("tls-nv.tlshs.server")
+
+// Start: a client writes its ClientHello, a server waits for one.
+pub fn begin(s: TlsSession) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.begin")
+
+// Hand the session bytes from the peer.
+//
+// One call takes any number of bytes, whole records or parts of them:
+// the record layer inside reassembles, and a handshake message that
+// spans three records is as ordinary as three that share one.
+pub fn feed(s: TlsSession, chunk: [u8]) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.feed")
+
+// Drain the bytes that have to go on the wire.
+pub fn take_outgoing(s: TlsSession) -> (TlsSession, Bytes) []
+    todo("tls-nv.tlshs.take_outgoing")
+
+// Drain decrypted application data.
+pub fn take_plaintext(s: TlsSession) -> (TlsSession, Bytes) []
+    todo("tls-nv.tlshs.take_plaintext")
+
+// The chain a `TlsCheckCertificate` action is asking about, leaf
+// first.
+pub fn pending_chain(s: TlsSession) -> [Bytes] []
+    todo("tls-nv.tlshs.pending_chain")
+
+// The group and peer public key a `TlsPerformKeyExchange` action is
+// asking about.
+pub fn pending_key_exchange(s: TlsSession) -> ?TlsKeyShareEntry []
+    todo("tls-nv.tlshs.pending_key_exchange")
+
+// The bytes a `TlsSignTranscript` action wants signed — already the
+// 64-space context form, so a caller signs what it is given and makes
+// no decision about framing.
+pub fn pending_signature_input(s: TlsSession) -> ?Bytes []
+    todo("tls-nv.tlshs.pending_signature_input")
+
+// Answer a `TlsPerformKeyExchange`.
+//
+// The shared secret is computed by whoever holds the private key —
+// x25519-nv, p256-nv, or a secure element the caller talks to — and
+// this package never sees it.
+pub fn supply_shared_secret(s: TlsSession, shared: Bytes) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.supply_shared_secret")
+
+// Answer a `TlsCheckCertificate` with the verdict.
+//
+// A `?TlsVerifyFault` and not a `Bool`: the reason travels into the
+// alert the peer receives and into the error the application sees, and
+// a caller that could only say "no" would make every certificate
+// failure look the same.
+pub fn supply_certificate_verdict(s: TlsSession,
+                                  fault: ?TlsVerifyFault) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.supply_certificate_verdict")
+
+// Answer a `TlsSignTranscript` with the signature.
+pub fn supply_signature(s: TlsSession, signature: Bytes) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.supply_signature")
+
+// Encrypt application data into the outgoing buffer.
+//
+// Refused before `TlsConnected`, because the only thing that could be
+// sent earlier is early data and this package does not do early data.
+pub fn send_application_data(s: TlsSession, plaintext: Bytes) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.send_application_data")
+
+// Send a KeyUpdate, ratcheting the write key.
+//
+// `ask_peer` asks the peer to update its own, which it answers with a
+// KeyUpdate that does not ask again — a pair that asked each other
+// would ratchet forever.
+pub fn request_key_update(s: TlsSession, ask_peer: Bool) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.request_key_update")
+
+// Send close_notify.
+//
+// Half-close: the peer may still send, and a caller that wants the rest
+// of the response keeps reading.  A connection torn down without this
+// is one whose peer cannot tell a finished response from a truncated
+// one, which is the truncation attack TLS 1.0 shipped with.
+pub fn close(s: TlsSession) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.close")
+
+// Send a fatal alert and fail the session.
+pub fn abort(s: TlsSession, alert: TlsAlert) -> Result<TlsStep, TlsHsFault> []
+    todo("tls-nv.tlshs.abort")
+
+// Where the handshake stands.
+pub fn state_of(s: TlsSession) -> TlsHsState []
+    todo("tls-nv.tlshs.state_of")
+
+// The protocol ALPN agreed on, or `None` when none was negotiated.
+pub fn alpn_of(s: TlsSession) -> ?Str []
+    todo("tls-nv.tlshs.alpn_of")
+
+// The suite in use, or `None` before the ServerHello.
+pub fn suite_of(s: TlsSession) -> ?TlsCipherSuite []
+    todo("tls-nv.tlshs.suite_of")
+
+// The peer's certificate chain, once one has arrived and been accepted.
+pub fn peer_chain_of(s: TlsSession) -> [Bytes] []
+    todo("tls-nv.tlshs.peer_chain_of")
+
+// Whether the handshake has completed.
+pub fn is_handshake_done(s: TlsSession) -> Bool []
+    todo("tls-nv.tlshs.is_handshake_done")
+
+// Any NewSessionTickets the server sent after the handshake.
+//
+// After, not during: a client that stopped reading at
+// `TlsHandshakeDone` never receives one, which is why they are drained
+// separately rather than reported as a handshake result.
+pub fn tickets_of(s: TlsSession) -> [TlsTicket] []
+    todo("tls-nv.tlshs.tickets_of")
+
+// The alert code for a description.
+pub fn alert_code(a: TlsAlert) -> Int []
+    todo("tls-nv.tlshs.alert_code")
+
+// The description an alert code names.
+pub fn alert_of_code(code: Int) -> TlsAlert []
+    todo("tls-nv.tlshs.alert_of_code")
+
+// Whether an alert ends the connection.
+//
+// Every alert in TLS 1.3 except close_notify is fatal — the warning
+// level is gone — so this answers false for exactly one value, and it
+// exists so a reader of calling code can see that rather than having to
+// know it.
+pub fn is_fatal(a: TlsAlert) -> Bool []
+    todo("tls-nv.tlshs.is_fatal")
+
+// What the state machine refused, in one line.
+//
+// The unexpected-message line names the message AND the state, because
+// either alone sends the reader to the wrong half of the handshake.
+//
+// ```novo ignore
+// use tlshs
+//
+// fn report(e: TlsHsFault) -> Str
+//     e.message()
+// ```
+impl Error for TlsHsFault
+    fn message(self) -> Str
+        todo("tls-nv.tlshs.TlsHsFault.message")
